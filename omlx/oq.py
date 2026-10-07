@@ -843,12 +843,16 @@ def _structural_quant_overrides(
     size 32 for them, but pricing them at the default group size 64 makes the
     planner classify the table as an unquantizable 16-bpw tensor.  Since PLE
     is about 51B parameters, that false cost can exhaust the entire budget and
-    suppress every protection boost even though the writer emits Q4/group32.
+    suppress every protection boost even though the writer emits the same
+    ngram width at group32.
     """
     base_bits = _base_bits_for_level(oq_level)
+    ngram_bits = None
+    if "_oq_ngram_bits" in config and config["_oq_ngram_bits"] is not None:
+        ngram_bits = int(config["_oq_ngram_bits"])
     return {
         path: {
-            "bits": base_bits,
+            "bits": ngram_bits if ngram_bits is not None else base_bits,
             "group_size": _QWEN4_EXP_NGRAM_GROUP_SIZE,
             "mode": "affine",
         }
@@ -4556,13 +4560,16 @@ def _get_predicate_bits(
 
     # Qwen4-Exp's PLE rows are 160 elements wide, so the default group size
     # 64 leaves the 100 GB N-gram table unquantized. Keep the table uniform at
-    # the selected oQ level and use the group-32 layout published by existing
-    # Qwen4-Exp quantizations. Embeddings have no input-channel imatrix entry;
-    # the streaming loop deliberately applies ordinary affine quantization.
+    # the selected oQ level (or at _oq_ngram_bits when the caller overrides
+    # it, e.g. Q8 for an oQ4e run) and use the group-32 layout published by
+    # existing Qwen4-Exp quantizations. Embeddings have no input-channel
+    # imatrix entry; the streaming loop deliberately applies ordinary affine
+    # quantization.
     if _is_qwen4_exp_ngram_embedding_tensor(tensor_name, config) or (
         config.get("model_type") == "deepseek_v41" and ".engram.embed" in tensor_name
     ):
-        return base_bits, _QWEN4_EXP_NGRAM_GROUP_SIZE, "affine"
+        ngram_bits = config.get("_oq_ngram_bits") or base_bits
+        return ngram_bits, _QWEN4_EXP_NGRAM_GROUP_SIZE, "affine"
 
     result = universal_quant_predicate(tensor_name, None, config, oq_level)
     if result is False:
@@ -5335,6 +5342,24 @@ def _source_imatrix_signature(
             for block in iter(lambda: f.read(1024 * 1024), b""):
                 ch.update(block)
         calib_hash = ch.hexdigest()
+    else:
+        custom = Path(str(calib_dataset))
+        if custom.is_file():
+            custom_files = [custom]
+        elif custom.is_dir():
+            custom_files = sorted(custom.glob("*.txt"))
+        else:
+            custom_files = []
+        if custom_files:
+            # Content-hash a user-supplied corpus so edits to the files
+            # invalidate a stale imatrix cache instead of silently reusing it.
+            ch = hashlib.sha256()
+            for f in custom_files:
+                ch.update(f.name.encode("utf-8"))
+                with open(f, "rb") as fh:
+                    for block in iter(lambda: fh.read(1024 * 1024), b""):
+                        ch.update(block)
+            calib_hash = ch.hexdigest()
     signature = {
         "format": _OQE_IMATRIX_FORMAT,
         "model_name": source.name,
@@ -5922,6 +5947,9 @@ def quantize_oq_streaming(
     sensitivity_map_override: dict[int | str, float] | None = None,
     stream_calibration: bool | None = None,
     preserve_ngram_table: bool = False,
+    calib_dataset: str | None = None,
+    sensitivity_calib_dataset: str | None = None,
+    ngram_bits: int | None = None,
 ) -> None:
     """Tensor-by-tensor quantization. Memory: ~3-4GB regardless of model size.
 
@@ -5994,6 +6022,20 @@ def quantize_oq_streaming(
             sensitivity is far below the core's), and a passthrough leaves
             no per-layer quantization entry so loaders treat the shards as
             plain weights. No effect on other model types.
+        calib_dataset: Calibration corpus for the oQe imatrix pass.
+            Accepts a built-in name (default ``"oqe_code_multilingual"``),
+            an HF dataset name, or a path to a .txt file / directory of
+            .txt files (e.g. a custom corpus bundle). Only used when
+            enhanced is True; the imatrix cache key includes a content
+            hash of custom paths so corpus edits invalidate stale caches.
+        sensitivity_calib_dataset: Calibration corpus for layer
+            sensitivity measurement (default ``"code_multilingual"``).
+            Same accepted values as calib_dataset.
+        ngram_bits: Bit width for the qwen4_exp N-gram PLE table
+            (default: the selected oQ level, e.g. Q4 at oQ4e). Pass 8 to
+            keep the table at Q8 group-32 affine while the rest of the
+            model follows the oQ level. No effect on other model types.
+            Cannot be combined with preserve_ngram_table.
     """
     if oq_level not in OQ_LEVELS:
         raise ValueError(
@@ -6001,6 +6043,12 @@ def quantize_oq_streaming(
         )
     if dtype not in OQ_DTYPES:
         raise ValueError(f"Invalid dtype {dtype!r}. Must be one of {OQ_DTYPES}")
+    if ngram_bits is not None and int(ngram_bits) not in _VALID_QUANT_BITS:
+        raise ValueError(
+            f"Invalid ngram_bits {ngram_bits!r}. Must be one of {_VALID_QUANT_BITS}"
+        )
+    if ngram_bits is not None and preserve_ngram_table:
+        raise ValueError("ngram_bits cannot be combined with preserve_ngram_table")
     target_dtype = mx.bfloat16 if dtype == "bfloat16" else mx.float16
 
     source = Path(model_path)
@@ -6041,6 +6089,15 @@ def quantize_oq_streaming(
         and not text_only
     )
     if normalized_model_type == "deepseek_v41":
+        if (
+            calib_dataset is not None
+            or sensitivity_calib_dataset is not None
+            or ngram_bits is not None
+        ):
+            raise ValueError(
+                "calib_dataset, sensitivity_calib_dataset and ngram_bits are "
+                "not supported on the deepseek_v41 quantization path"
+            )
         from .patches.deepseek_v41.oq import quantize as quantize_v41
 
         return quantize_v41(
@@ -6075,6 +6132,12 @@ def quantize_oq_streaming(
         )
         text_only = True
     _validate_oq_dtype_for_model(config, dtype)
+    if calib_dataset is None:
+        calib_dataset = _OQE_CALIB_DATASET
+    if sensitivity_calib_dataset is None:
+        sensitivity_calib_dataset = "code_multilingual"
+    if ngram_bits is not None:
+        config["_oq_ngram_bits"] = int(ngram_bits)
     static_sensitivity_map = _normalize_sensitivity_map_override(
         config, sensitivity_map_override
     )
@@ -6289,7 +6352,9 @@ def quantize_oq_streaming(
                 sensitivity_oq_level=oq_level,
                 sensitivity_num_samples=_SENS_NUM_SAMPLES,
                 sensitivity_seq_length=_SENS_SEQ_LENGTH,
+                sensitivity_calib_dataset=sensitivity_calib_dataset,
                 require_mtp_entries=preserve_mtp,
+                calib_dataset=calib_dataset,
             )
         except BaseException:
             _cleanup_ram_safe_proxy()
@@ -6342,6 +6407,7 @@ def quantize_oq_streaming(
                 sensitivity_model_path,
                 config,
                 oq_level,
+                calib_dataset=sensitivity_calib_dataset,
                 num_samples=128,
                 seq_length=256,
                 trust_remote_code=trust_remote_code,
@@ -6364,6 +6430,7 @@ def quantize_oq_streaming(
                 model_path,
                 config,
                 oq_level,
+                calib_dataset=sensitivity_calib_dataset,
                 num_samples=_SENS_NUM_SAMPLES,
                 seq_length=_SENS_SEQ_LENGTH,
                 trust_remote_code=trust_remote_code,
@@ -6380,6 +6447,7 @@ def quantize_oq_streaming(
                 model_path,
                 config,
                 oq_level,
+                calib_dataset=sensitivity_calib_dataset,
                 num_samples=128,
                 seq_length=256,
                 trust_remote_code=trust_remote_code,
@@ -6403,6 +6471,7 @@ def quantize_oq_streaming(
                     str(_proxy_dir),
                     config,
                     oq_level,
+                    calib_dataset=sensitivity_calib_dataset,
                     num_samples=128,
                     seq_length=256,
                     trust_remote_code=trust_remote_code,
@@ -6432,6 +6501,7 @@ def quantize_oq_streaming(
                 model_path,
                 config,
                 oq_level,
+                calib_dataset=sensitivity_calib_dataset,
                 num_samples=128,
                 seq_length=256,
                 trust_remote_code=trust_remote_code,
@@ -6973,13 +7043,25 @@ def _load_calibration_data(
     Args:
         tokenizer: Model tokenizer.
         dataset: "code_multilingual" (built-in default), "code", "multilingual",
-                 "default" (mlx-lm generic), or HuggingFace dataset names.
+                 "default" (mlx-lm generic), HuggingFace dataset names,
+                 or a path to a .txt file / directory of .txt files.
         num_samples: Number of calibration samples.
         seq_length: Sequence length per sample.
 
     Returns:
         MLX array of shape (num_samples, seq_length) or None on failure.
     """
+    custom = Path(str(dataset))
+    if custom.exists():
+        # A user-supplied corpus file (or directory of .txt files) uses the
+        # same tokenize/pack path as the built-in corpora. Never fall back
+        # to another corpus here: silently calibrating on generic data
+        # would invalidate the experiment with no signal to the caller.
+        try:
+            return _load_file_calibration(tokenizer, custom, num_samples, seq_length)
+        except Exception as e:
+            logger.warning(f"Custom calibration {custom} failed: {e}")
+            return None
     if dataset == _OQE_CALIB_DATASET:
         # oQe (enhanced=True) requests this built-in corpus by name. If the data
         # file is not present in the installed package, the generic handler below
@@ -7034,8 +7116,6 @@ def _load_builtin_calibration(
     tokenizer, dataset: str, num_samples: int, seq_length: int
 ):
     """Load from built-in calibration JSON files shipped with the package."""
-    import mlx.core as mx
-
     data_file = (
         "oqe_calibration_data.json"
         if dataset == _OQE_CALIB_DATASET
@@ -7073,6 +7153,13 @@ def _load_builtin_calibration(
     total_kb = sum(len(t) for t in texts) // 1024
     logger.info(f"Built-in calibration: {len(texts)} texts, {total_kb} KB ({dataset})")
 
+    return _pack_texts_to_samples(tokenizer, texts, num_samples, seq_length)
+
+
+def _pack_texts_to_samples(tokenizer, texts, num_samples: int, seq_length: int):
+    """Tokenize texts into an (N, seq_length) sample array (shared helper)."""
+    import mlx.core as mx
+
     all_ids = []
     for text in texts:
         ids = tokenizer.encode(text)
@@ -7097,6 +7184,30 @@ def _load_builtin_calibration(
 
     logger.info(f"Calibration: {tokens.shape[0]} samples x {seq_length} tokens")
     return tokens
+
+
+def _load_file_calibration(tokenizer, path, num_samples: int, seq_length: int):
+    """Load calibration texts from a user-supplied file or directory.
+
+    A file is read whole as UTF-8 text; a directory concatenates its
+    ``*.txt`` files in sorted order (the ``cat calibration/*.txt`` bundle
+    layout). Token-stream calibration concatenates everything downstream,
+    so block delimiters need no special handling here.
+    """
+    p = Path(path)
+    if p.is_dir():
+        files = sorted(p.glob("*.txt"))
+        if not files:
+            raise ValueError(f"No .txt files found in calibration directory: {p}")
+        texts = [f.read_text(encoding="utf-8") for f in files]
+    else:
+        texts = [p.read_text(encoding="utf-8")]
+    texts = [t for t in texts if t.strip()]
+    if not texts:
+        raise ValueError(f"No calibration text available in {p}")
+    total_kb = sum(len(t) for t in texts) // 1024
+    logger.info(f"Custom calibration: {len(texts)} texts, {total_kb} KB ({p})")
+    return _pack_texts_to_samples(tokenizer, texts, num_samples, seq_length)
 
 
 def _load_hf_calibration(tokenizer, dataset: str, num_samples: int, seq_length: int):
@@ -9520,6 +9631,7 @@ def _load_or_collect_imatrix(
     sensitivity_oq_level=None,
     sensitivity_num_samples: int = 32,
     sensitivity_seq_length: int = 256,
+    sensitivity_calib_dataset: str = "code_multilingual",
     require_mtp_entries: bool = True,
 ) -> OQImatrixData:
     source = Path(model_path)
@@ -9601,6 +9713,7 @@ def _load_or_collect_imatrix(
             sensitivity_oq_level=sensitivity_oq_level,
             sensitivity_num_samples=sensitivity_num_samples,
             sensitivity_seq_length=sensitivity_seq_length,
+            sensitivity_calib_dataset=sensitivity_calib_dataset,
             require_mtp_entries=require_mtp_entries,
         )
     else:
