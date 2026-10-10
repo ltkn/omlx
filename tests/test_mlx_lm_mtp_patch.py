@@ -23,7 +23,7 @@ from mlx_lm.models.cache import KVCache
 from omlx.model_settings import ModelSettings
 from omlx.patches import mlx_lm_mtp
 from omlx.patches.mlx_lm_mtp import batch_generator as bg
-from omlx.patches.mlx_lm_mtp import batched_head, cache_rollback
+from omlx.patches.mlx_lm_mtp import batched_head, cache_rollback, fused_batch
 from omlx.patches.mlx_lm_mtp.batch_policy import BatchPolicy
 from omlx.patches.mlx_vlm_mtp import qwen35_verify_linear
 from omlx.utils.model_loading import (
@@ -4588,18 +4588,16 @@ def test_multi_request_mtp_or_singleton_only_matches_standard(
         mlx_lm_mtp.set_mtp_depth(depth)
 
 
-@pytest.mark.parametrize("family", ["qwen", "qwen4"])
+@pytest.mark.parametrize("family", ["qwen", "qwen4", "v41"])
 def test_context_copy_drafts_keep_greedy_output(family, monkeypatch):
     """Copied drafts never change greedy output, whichever of them is wrong.
 
     The proposer is replaced by the true continuation with one token flipped
-    at a position that moves every cycle, so the widest (16-row) windows are
-    verified with accepted lengths from none to all.
+    at a position that moves every cycle, so the widest windows (16 rows, or
+    the DSpark block depth) are verified with accepted lengths from none to all.
     """
     from omlx.patches.mlx_lm_mtp import context_copy
 
-    widest = context_copy.MAX_COPY
-    flips = (0, 1, 7, widest - 1, widest)  # ``widest``: nothing flipped
     previous = mlx_lm_mtp.is_mtp_active()
     try:
         mlx_lm_mtp.set_mtp_active(True)
@@ -4609,6 +4607,9 @@ def test_context_copy_drafts_keep_greedy_output(family, monkeypatch):
         host = getattr(
             model, "_language_model", getattr(model, "language_model", model)
         )
+        widest = host._omlx_mtp_depth if family == "v41" else context_copy.MAX_COPY
+        # ``widest``: nothing flipped.
+        flips = sorted({0, 1, min(7, widest), widest - 1, widest})
         prompt = [3, 4, 5, 6, 7, 8, 9, 10]
         host._omlx_mtp_decode_enabled = False
         expected, _ = generate(model, [prompt], [64])
@@ -4631,6 +4632,79 @@ def test_context_copy_drafts_keep_greedy_output(family, monkeypatch):
         actual, _ = generate(model, [prompt], [64])
         assert actual == expected
         assert set(flips) <= set(accepted)
+    finally:
+        mlx_lm_mtp.set_mtp_active(previous)
+
+
+def test_dspark_keeps_its_block_over_shorter_copies(monkeypatch):
+    """A copy shorter than the DSpark block would replace a better draft."""
+    from omlx.patches.mlx_lm_mtp import context_copy
+
+    previous = mlx_lm_mtp.is_mtp_active()
+    try:
+        mlx_lm_mtp.set_mtp_active(True)
+        model = _model("v41")
+        model.configure_mtp(True, 3)
+        prompt = [3, 4, 5, 6, 7, 8, 9, 10]
+        model._omlx_mtp_decode_enabled = False
+        expected, _ = generate(model, [prompt], [24])
+        model._omlx_mtp_decode_enabled = True
+        copies = []
+        monkeypatch.setattr(
+            context_copy.ContextCopy, "propose", lambda self, limit: [1, 2][:limit]
+        )
+        monkeypatch.setattr(
+            context_copy.ContextCopy,
+            "observe",
+            lambda self, accepted, drafted: copies.append(drafted),
+        )
+        actual, _ = generate(model, [prompt], [24])
+        assert actual == expected
+        assert not copies
+    finally:
+        mlx_lm_mtp.set_mtp_active(previous)
+
+
+def test_batch_policy_skips_copied_windows(monkeypatch):
+    """Copied windows are not draft-depth decisions for the batch policy."""
+    from omlx.patches.mlx_lm_mtp import context_copy
+    from omlx.patches.mlx_lm_mtp.batch_policy import BatchPolicy
+
+    previous = mlx_lm_mtp.is_mtp_active()
+    try:
+        mlx_lm_mtp.set_mtp_active(True)
+        model = _model("v41")
+        prompts = [[3, 4, 5, 6, 7, 8, 9, 10], [5, 6, 7, 8, 9, 10, 11]]
+        model._omlx_mtp_decode_enabled = False
+        expected, _ = generate(model, prompts, [24, 24])
+        model._omlx_mtp_decode_enabled = True
+        prompt_of = {tuple(p[:3]): i for i, p in enumerate(prompts)}
+
+        def propose(self, limit):
+            row = prompt_of[tuple(self._ids[:3])]
+            done = len(self._ids) - len(prompts[row])
+            return list(expected[row][done : done + limit])
+
+        copied_cycles, decisions = [], []
+        verify = bg._run_verify_cycle_batched
+        mtp = BatchPolicy.observe_mtp
+
+        def verify_batched(gen_batch, batch_state):
+            states = [batch_state.states[uid] for uid in gen_batch.uids]
+            copied_cycles.append(any(state.copy_drafts for state in states))
+            return verify(gen_batch, batch_state)
+
+        def observe_mtp(self, depth, accepted, milliseconds, *, stable):
+            decisions.append(copied_cycles[-1])
+            mtp(self, depth, accepted, milliseconds, stable=stable)
+
+        monkeypatch.setattr(context_copy.ContextCopy, "propose", propose)
+        monkeypatch.setattr(bg, "_run_verify_cycle_batched", verify_batched)
+        monkeypatch.setattr(BatchPolicy, "observe_mtp", observe_mtp)
+        actual, _ = generate(model, prompts, [24, 24])
+        assert actual == expected
+        assert any(copied_cycles) and decisions
+        assert not any(decisions)
     finally:
         mlx_lm_mtp.set_mtp_active(previous)
 
@@ -5801,3 +5875,25 @@ def test_batch_park_expires_while_cohorts_come_and_go():
     # The 128-step park, then one cohort's calibration (2 warmup + 3 samples).
     assert first_mtp is not None and first_mtp <= 128 + 150 + 5
     assert mtp_cycles > 0.9 * (6000 - first_mtp) - 5 * 6000 / 50
+
+
+def test_rows_rebuilt_under_a_lowered_policy_depth_keep_tokens(monkeypatch):
+    """A fallback rebuilds rows that draft deeper than the lowered policy depth."""
+    advance = fused_batch.advance
+    fired = []
+
+    def fall_back_once(batch, batch_state):
+        if not fired and batch._omlx_mtp_batch_policy.cur < 2:
+            fired.append(True)
+            raise bg._MtpStepFallback("test")
+        return advance(batch, batch_state)
+
+    monkeypatch.setattr(fused_batch, "advance", fall_back_once)
+    model = CountingModel()
+    prompts, limits = [[1, 2], [10, 11, 12]], [60, 60]
+    model._omlx_mtp_decode_enabled = False
+    expected, _ = generate(model, prompts, limits)
+    model._omlx_mtp_decode_enabled = True
+    actual, _ = generate(model, prompts, limits)
+    assert fired
+    assert actual == expected
