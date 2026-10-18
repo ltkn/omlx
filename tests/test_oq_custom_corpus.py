@@ -11,12 +11,12 @@ except ImportError:
     HAS_MLX = False
 
 from omlx.oq import (
+    _budgeted_shapes,
     _get_predicate_bits,
     _load_calibration_data,
     _load_file_calibration,
     _pack_texts_to_samples,
     _source_imatrix_signature,
-    _structural_quant_overrides,
     quantize_oq_streaming,
 )
 
@@ -60,24 +60,12 @@ class TestNgramBitsOverride:
 
         assert (bits, gs, mode) == (4, 64, "affine")
 
-    def test_structural_overrides_price_override_bits(self):
+    def test_ngram_table_excluded_from_bit_budget(self):
         named_shapes = {_NGRAM_BASE: (2_800, 160)}
 
-        default = _structural_quant_overrides(named_shapes, _qwen4_config(), 4)
-        boosted = _structural_quant_overrides(
-            named_shapes, _qwen4_config(_oq_ngram_bits=8), 4
-        )
+        budgeted = _budgeted_shapes(named_shapes, _qwen4_config())
 
-        assert default[_NGRAM_BASE] == {
-            "bits": 4,
-            "group_size": 32,
-            "mode": "affine",
-        }
-        assert boosted[_NGRAM_BASE] == {
-            "bits": 8,
-            "group_size": 32,
-            "mode": "affine",
-        }
+        assert budgeted == {}
 
     def test_quantize_rejects_invalid_ngram_bits(self):
         with pytest.raises(ValueError, match="ngram_bits"):
