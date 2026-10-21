@@ -738,3 +738,64 @@ def test_unobserved_expert_uses_affine_three_bits_without_importance():
         for suffix, expected in zip(("weight", "scales", "biases"), observed):
             assert mx.array_equal(result["p." + suffix][0], expected).item()
         assert spec["bits"] == 3 and spec["mode"] == "affine"
+
+
+def test_oq25_streams_v41_calibration_without_full_model_load(
+    tmp_path, monkeypatch
+):
+    from test_deepseek_v41 import write_checkpoint
+
+    from omlx import oq
+    from omlx.patches.deepseek_v41 import loading
+
+    with mx.stream(mx.cpu):
+        source, _ = write_checkpoint(
+            tmp_path,
+            vision=False,
+            dim=64,
+            moe_inter_dim=64,
+            engram_layer_ids=(1, 3),
+            engram_num_embeddings=(72, 204),
+            engram_vocab_size=5,
+            engram_max_ngram_size=4,
+            engram_n_heads=2,
+            engram_head_dim=32,
+            engram_compressed_vocab_size=64,
+        )
+        tokens = mx.array(
+            [
+                [3, 4, 5, 6, 7, 8, 9, 10],
+                [11, 12, 13, 14, 15, 16, 17, 18],
+            ]
+        )
+        monkeypatch.setattr(
+            oq,
+            "_load_calibration_data",
+            lambda tokenizer, dataset, num_samples, seq_length: tokens[:num_samples],
+        )
+
+        def no_full_load(*args, **kwargs):
+            raise AssertionError("V4.1 streaming calibration loaded the full model")
+
+        monkeypatch.setattr(loading, "load", no_full_load)
+        output = tmp_path / "oq25"
+        oq.quantize_oq_streaming(
+            str(source),
+            str(output),
+            2.5,
+            enhanced=True,
+            target_bpw=32,
+            hard_cap_bpw=32,
+            imatrix_num_samples=2,
+            imatrix_seq_length=8,
+            imatrix_cache_path=str(tmp_path / "imatrix.npz"),
+            imatrix_reuse_cache=False,
+            stream_calibration=True,
+        )
+
+    report = json.loads((output / "quantization_report.json").read_text())
+    calibration = report["calibration"]
+    assert calibration["calibration_streaming"] is True
+    assert calibration["imatrix_cache_reused"] is False
+    assert calibration["sensitivity"]
+    assert calibration["calibration_model"] == str(source)
