@@ -268,6 +268,101 @@ def test_oq_entrypoint_preserves_dspark_and_separate_report(tmp_path):
         model.close()
 
 
+def test_v41_ngram_bits_override_writes_q8_engram(tmp_path):
+    from test_deepseek_v41 import write_checkpoint
+
+    from omlx.patches.deepseek_v41.loading import load
+    from omlx.patches.deepseek_v41.oq import quantize
+
+    with mx.stream(mx.cpu):
+        source, _ = write_checkpoint(
+            tmp_path,
+            vision=False,
+            engram_layer_ids=(1, 3),
+            engram_num_embeddings=(72, 204),
+            engram_vocab_size=5,
+            engram_max_ngram_size=4,
+            engram_n_heads=2,
+            engram_head_dim=32,
+            engram_compressed_vocab_size=64,
+        )
+        default = tmp_path / "default"
+        quantize(source, default, enhanced=True, target_bpw=32, hard_cap_bpw=32)
+        output = tmp_path / "q8"
+        quantize(
+            source,
+            output,
+            enhanced=True,
+            target_bpw=32,
+            hard_cap_bpw=32,
+            ngram_bits=8,
+        )
+        config = json.loads((output / "config.json").read_text())
+        spec = config["omlx_deepseek_v41"]
+        assert all(table["bits"] == 8 for table in spec["engram_tables"].values())
+        assert all(
+            table["group_size"] == 32 for table in spec["engram_tables"].values()
+        )
+        report = json.loads((output / "quantization_report.json").read_text())
+        default_report = json.loads((default / "quantization_report.json").read_text())
+        assert report["engram"]["bits"] == 8
+        assert report["engram_bits_override"] == 8
+        assert default_report["engram"]["bits"] == 4
+        assert default_report["engram_bits_override"] is None
+        assert report["engram"]["tensor_bytes"] > (
+            default_report["engram"]["tensor_bytes"]
+        )
+        loaded, _ = load(output, engram_ssd_offload=True)
+        try:
+            assert len(spec["engram_tables"]) == 2
+            embed = loaded.language_model.layers[1].engram.embed
+            values = embed(mx.array([[0, 1, 2]]))
+            assert values.shape == (1, 3, 32)
+            assert mx.all(mx.isfinite(values)).item()
+        finally:
+            loaded.close()
+
+
+@pytest.mark.parametrize("ngram_bits", [5, 7])
+def test_v41_ngram_bits_rejects_unsupported_widths(tmp_path, ngram_bits):
+    from omlx.patches.deepseek_v41.oq import quantize
+
+    with pytest.raises(ValueError, match="Engram bits"):
+        quantize(
+            tmp_path / "source",
+            tmp_path / "output",
+            ngram_bits=ngram_bits,
+        )
+
+
+def test_v41_entrypoint_forwards_custom_corpus_and_ngram_bits(tmp_path, monkeypatch):
+    from omlx import oq
+    from omlx.patches.deepseek_v41 import oq as converter
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps({"model_type": "deepseek_v41"}))
+    received = {}
+
+    def fake_quantize(source, destination, **kwargs):
+        received.update(kwargs)
+
+    monkeypatch.setattr(converter, "quantize", fake_quantize)
+    oq.quantize_oq_streaming(
+        str(source),
+        str(tmp_path / "output"),
+        2.5,
+        enhanced=True,
+        calib_dataset="/corpora/calibration.txt",
+        sensitivity_calib_dataset="/corpora/sensitivity.txt",
+        ngram_bits=8,
+    )
+
+    assert received["calib_dataset"] == "/corpora/calibration.txt"
+    assert received["sensitivity_calib_dataset"] == "/corpora/sensitivity.txt"
+    assert received["ngram_bits"] == 8
+
+
 def test_unified_index_engram_and_mixed_shard_offload(tmp_path, monkeypatch):
     from test_deepseek_v41 import write_checkpoint
 
@@ -528,6 +623,11 @@ def test_v41_estimate_uses_independent_engram_budget(tmp_path, level):
         == result["engram_size_bytes"] + result["remaining_size_bytes"]
     )
     assert result["memory_streaming_bytes"] > 0
+
+    q8 = estimate_bpw_and_size(str(source), level, ngram_bits=8)
+    assert q8["engram_size_bytes"] == 8192 + 8192 // 32 * 4
+    assert q8["remaining_size_bytes"] == result["remaining_size_bytes"]
+    assert q8["output_size_bytes"] > result["output_size_bytes"]
 
 
 @pytest.mark.parametrize("level", [2.5, 3])

@@ -2,12 +2,13 @@
 """Budget-checked oQ2-oQ4 export of the mixed-precision V4.1 release.
 
 Engram follows Qwen4-Exp's uniform affine group-32 embedding policy, stays at
-4 bits and is excluded from the remaining weights' bit budget. If all other
-source weights fit their independent budget at original precision, that
-allocation dominates every lossy alternative: neither sensitivity ranking nor
-an imatrix can improve it. Levels below oQ4 measure layer sensitivity and
-projection input statistics, then use the official mixed-bit allocator and
-weighted affine arithmetic for the e variants.
+4 bits by default (or the caller's ngram_bits override) and is excluded from
+the remaining weights' bit budget. If all other source weights fit their
+independent budget at original precision, that allocation dominates every
+lossy alternative: neither sensitivity ranking nor an imatrix can improve it.
+Levels below oQ4 measure layer sensitivity and projection input statistics,
+then use the official mixed-bit allocator and weighted affine arithmetic for
+the e variants.
 """
 
 import json
@@ -294,6 +295,9 @@ def quantize(
     imatrix_strict=False,
     imatrix_num_samples=128,
     imatrix_seq_length=512,
+    calib_dataset=None,
+    sensitivity_calib_dataset=None,
+    ngram_bits=None,
 ):
     from ...oq import (
         _OQ_BPW_TARGETS,
@@ -305,7 +309,11 @@ def quantize(
     )
 
     _validate_v41_oq_settings(oq_level, dtype, group_size)
-    engram_bits = _offload_table_bits(oq_level)
+    if ngram_bits is not None and int(ngram_bits) not in (2, 3, 4, 6, 8):
+        raise ValueError("V4.1 Engram bits must be one of 2, 3, 4, 6 or 8")
+    engram_bits = (
+        _offload_table_bits(oq_level) if ngram_bits is None else int(ngram_bits)
+    )
     if oq_level == 4 and (sensitivity_model_path or sensitivity_map_override):
         raise ValueError(
             "V4.1 original-precision oQ4 does not use sensitivity overrides"
@@ -360,6 +368,8 @@ def quantize(
             imatrix_strict=imatrix_strict,
             imatrix_num_samples=imatrix_num_samples,
             imatrix_seq_length=imatrix_seq_length,
+            calib_dataset=calib_dataset,
+            sensitivity_calib_dataset=sensitivity_calib_dataset,
             progress_callback=progress_callback,
         )
         budget["remaining_weights"].update(
@@ -384,6 +394,7 @@ def quantize(
         "calibration": "not_needed_no_linear_requantization",
         "imatrix_applied_modules": [],
         "storage_layout": "unified_safetensors_index",
+        "engram_bits_override": None if ngram_bits is None else engram_bits,
     }
     if allocation:
         report.update(
@@ -402,8 +413,9 @@ def quantize(
     exported_tables = {}
     engram_start, engram_span = (20, 20) if oq_level < 4 else (0, 30)
     projection_start = engram_start + engram_span
+    policy_config = {**config, "_oq_ngram_bits": engram_bits}
     for i, (name, table) in enumerate(tables.items()):
-        if _get_predicate_bits(name + ".weight", config, oq_level, 64) != (
+        if _get_predicate_bits(name + ".weight", policy_config, oq_level, 64) != (
             engram_bits,
             32,
             "affine",
@@ -571,6 +583,8 @@ def prepare_affine_conversion(
     imatrix_strict,
     imatrix_num_samples,
     imatrix_seq_length,
+    calib_dataset=None,
+    sensitivity_calib_dataset=None,
     progress_callback,
 ):
     from ...oq import (
@@ -589,6 +603,8 @@ def prepare_affine_conversion(
         raise ValueError(
             "V4.1 calibration sample count and sequence length must be positive"
         )
+    calib_dataset = calib_dataset or _OQE_CALIB_DATASET
+    sensitivity_calib_dataset = sensitivity_calib_dataset or "code_multilingual"
     calibration_source = (
         Path(sensitivity_model_path) if sensitivity_model_path else source
     )
@@ -606,7 +622,7 @@ def prepare_affine_conversion(
             proxy_config,
             num_samples=imatrix_num_samples,
             seq_length=imatrix_seq_length,
-            calib_dataset=_OQE_CALIB_DATASET,
+            calib_dataset=calib_dataset,
         )
     if not imatrix_cache_path:
         imatrix_cache_path = str(
@@ -623,6 +639,7 @@ def prepare_affine_conversion(
         seq_length=imatrix_seq_length,
         strict=imatrix_strict,
         trust_remote_code=False,
+        calib_dataset=calib_dataset,
         progress_callback=progress_callback,
         progress_start=1,
         progress_end=10,
@@ -657,6 +674,7 @@ def prepare_affine_conversion(
                 model,
                 processor.tokenizer,
                 bits=_base_bits_for_level(oq_level),
+                calib_dataset=sensitivity_calib_dataset,
                 progress=progress,
             )
         finally:
@@ -681,6 +699,8 @@ def prepare_affine_conversion(
         expert_coverage=coverage,
         sensitivity=sensitivity,
         calibration_model=str(calibration_source),
+        calib_dataset=calib_dataset,
+        sensitivity_calib_dataset=sensitivity_calib_dataset,
         uncalibrated_policy="preserve_source_precision",
     )
     return allocation, imatrix, report
