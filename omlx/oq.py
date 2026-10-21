@@ -6473,12 +6473,17 @@ def quantize_oq_streaming(
             standalone streamed pass on an imatrix cache hit. An existing
             oq_sensitivity_map.json or an explicit sensitivity_model_path
             still wins over both. None (default) auto-enables streaming when
-            the source exceeds the RAM budget. The streamed sourcer supports
-            the MiniMax-M3 (minimax_m3_vl) and Qwen4-Exp (qwen4_exp) layouts,
-            so the auto rule stays on the RAM-safe proxy for every other
-            model_type, and an explicit stream_calibration=True on an
+            the source exceeds the RAM budget. DeepSeek V4.1 has its own
+            block-streamed collector and defaults to streaming regardless of
+            source size; pass False there to use the resident path. The
+            generic sourcer supports the MiniMax-M3 (minimax_m3_vl),
+            Qwen4-Exp (qwen4_exp), GLM5-Next, Muse Spark and DeepSeek V4.1
+            layouts, so the auto rule stays on the RAM-safe proxy for every
+            other model_type, and an explicit stream_calibration=True on an
             unsupported layout raises a ValueError up front instead of
             failing deep in the sourcer. Only consulted when enhanced is True.
+            For V4.1, sensitivity_model_path is ignored while streaming
+            because the streamed pass reads the original source directly.
         preserve_ngram_table: Write the qwen4_exp N-gram PLE table
             (``ple_embedding.ngram_embedding`` shard tensors) unquantized, in
             the checkpoint dtype, instead of at the selected oQ level. The
@@ -6578,6 +6583,7 @@ def quantize_oq_streaming(
             calib_dataset=calib_dataset,
             sensitivity_calib_dataset=sensitivity_calib_dataset,
             ngram_bits=ngram_bits,
+            stream_calibration=stream_calibration,
             progress_callback=progress_callback,
         )
     if (
@@ -9216,7 +9222,9 @@ def _collect_imatrix_from_model(
 # below). A third architecture with a different tensor tree needs a
 # model-type dispatch for the prefix/embed constants, and its model_type
 # joins _STREAM_CALIBRATION_SUPPORTED_MODEL_TYPES so the calibration
-# decision starts routing it through the streamed path.
+# decision starts routing it through the streamed path. DeepSeek V4.1 has
+# its own block loader and cache/Engram state machine (in
+# patches.deepseek_v41.calibration), but advertises the same capability.
 
 _STREAM_TEXT_LAYER_PREFIX = "language_model.model.layers."
 _STREAM_EMBED_KEY = "language_model.model.embed_tokens.weight"
@@ -9226,7 +9234,7 @@ _STREAM_EMBED_KEY = "language_model.model.embed_tokens.weight"
 # and an explicit stream_calibration request for one fails fast (see
 # _resolve_stream_calibration). Keep this in lockstep with the sourcer above.
 _STREAM_CALIBRATION_SUPPORTED_MODEL_TYPES = frozenset(
-    {"minimax_m3_vl", "qwen4_exp", "glm5_next", "muse_spark"}
+    {"minimax_m3_vl", "qwen4_exp", "glm5_next", "muse_spark", "deepseek_v41"}
 )
 
 
@@ -9876,6 +9884,32 @@ def _collect_imatrix_streaming(
     exact metric _measure_sensitivity_from_model produces; requires
     ``sensitivity_oq_level`` for the qdq predicate.
     """
+    if _stream_source_model_type(config) == "deepseek_v41":
+        from .patches.deepseek_v41.calibration import (
+            collect_checkpoint_imatrix_streaming,
+        )
+
+        return collect_checkpoint_imatrix_streaming(
+            source,
+            tokenizer,
+            config,
+            calib_dataset=calib_dataset,
+            num_samples=num_samples,
+            seq_length=seq_length,
+            progress_callback=progress_callback,
+            progress_start=progress_start,
+            progress_end=progress_end,
+            trust_remote_code=trust_remote_code,
+            calib_data=calib_data,
+            calib_seed=calib_seed,
+            measure_sensitivity=measure_sensitivity,
+            sensitivity_oq_level=sensitivity_oq_level,
+            sensitivity_calib_dataset=sensitivity_calib_dataset,
+            sensitivity_num_samples=sensitivity_num_samples,
+            sensitivity_seq_length=sensitivity_seq_length,
+            sensitivity_calib_seed=sensitivity_calib_seed,
+            require_mtp_entries=require_mtp_entries,
+        )
     if measure_sensitivity and sensitivity_oq_level is None:
         raise ValueError("measure_sensitivity requires sensitivity_oq_level")
     from omlx.utils.model_loading import _checkpoint_has_mtp_weights, _has_mtp_heads
@@ -10430,7 +10464,20 @@ def _load_or_collect_imatrix(
             cache, config
         ):
             cache_load_kind = _oqe_cache_load_kind(cache)
-            if stream_calibration and cache_load_kind != "streaming":
+            # V4.1's resident collector always walks the full forward on the
+            # real signed checkpoint (or a proxy recorded in the signature).
+            # A cache without the proxy marker is therefore as valid for a
+            # streamed request as a stream-marked one; keep it so an existing
+            # calibrated export is not forced to re-read 300+ GB.
+            v41_resident_cache = (
+                str(config.get("model_type", "")).replace("-", "_")
+                == "deepseek_v41"
+                and cache_load_kind in (None, "resident")
+                and "_oq_calibration_proxy" not in config
+            )
+            if stream_calibration and not (
+                cache_load_kind == "streaming" or v41_resident_cache
+            ):
                 # The source signature cannot distinguish a cache collected
                 # on a lossy proxy from one streamed off the real weights,
                 # so a streaming request rejects anything not explicitly

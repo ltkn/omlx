@@ -373,3 +373,90 @@ def test_mtp_cache_reuse_requires_v41_preservation_policy(
         oq._oqe_cache_missing_mtp_entries(cache, {"model_type": model_type}, "source")
         is missing
     )
+
+
+def test_streaming_calibration_matches_resident_with_engram(tmp_path, monkeypatch):
+    import json
+
+    import mlx.core as mx
+    from mlx_lm.tokenizer_utils import load as load_tokenizer
+    from test_deepseek_v41 import write_checkpoint
+
+    from omlx import oq
+    from omlx.patches.deepseek_v41.calibration import (
+        collect_checkpoint_imatrix_streaming,
+        collect_imatrix,
+    )
+    from omlx.patches.deepseek_v41.loading import load
+    from omlx.patches.deepseek_v41.sensitivity import measure_sensitivity
+
+    source, _ = write_checkpoint(
+        tmp_path,
+        vision=False,
+        dim=64,
+        moe_inter_dim=64,
+        engram_layer_ids=(1, 3),
+        engram_num_embeddings=(72, 204),
+        engram_vocab_size=5,
+        engram_max_ngram_size=4,
+        engram_n_heads=2,
+        engram_head_dim=32,
+        engram_compressed_vocab_size=64,
+    )
+    config = json.loads((source / "config.json").read_text())
+    tokens = mx.array(
+        [
+            [3, 4, 5, 6, 7, 8],
+            [9, 10, 11, 12, 13, 14],
+        ]
+    )
+    monkeypatch.setattr(
+        oq,
+        "_load_calibration_data",
+        lambda tokenizer, dataset, num_samples, seq_length: tokens[:num_samples],
+    )
+    with mx.stream(mx.cpu):
+        model, processor = load(source, engram_ssd_offload=True)
+        try:
+            resident, _ = collect_imatrix(
+                model,
+                processor.tokenizer,
+                num_samples=2,
+                seq_length=6,
+                calib_dataset="fixture",
+            )
+            resident_sensitivity = measure_sensitivity(
+                model,
+                processor.tokenizer,
+                bits=2,
+                num_samples=2,
+                seq_length=6,
+                calib_dataset="fixture",
+            )
+        finally:
+            model.close()
+            del model, processor
+            mx.clear_cache()
+
+        streamed, metadata = collect_checkpoint_imatrix_streaming(
+            source,
+            load_tokenizer(source),
+            config,
+            calib_dataset="fixture",
+            num_samples=2,
+            seq_length=6,
+            calib_data=tokens,
+            measure_sensitivity=True,
+            sensitivity_oq_level=2.5,
+        )
+
+    assert set(streamed) == set(resident)
+    for name in resident:
+        np.testing.assert_array_equal(streamed[name].counts, resident[name].counts)
+        np.testing.assert_allclose(
+            streamed[name].in_sum2, resident[name].in_sum2, rtol=1e-5, atol=1e-5
+        )
+    assert metadata["load_kind"] == "streaming"
+    assert metadata["sensitivity_map"].keys() == resident_sensitivity.keys()
+    for layer, score in resident_sensitivity.items():
+        assert metadata["sensitivity_map"][layer] == pytest.approx(score, abs=1e-7)

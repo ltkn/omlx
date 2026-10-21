@@ -298,6 +298,7 @@ def quantize(
     calib_dataset=None,
     sensitivity_calib_dataset=None,
     ngram_bits=None,
+    stream_calibration=None,
 ):
     from ...oq import (
         _OQ_BPW_TARGETS,
@@ -371,6 +372,7 @@ def quantize(
             calib_dataset=calib_dataset,
             sensitivity_calib_dataset=sensitivity_calib_dataset,
             progress_callback=progress_callback,
+            stream_calibration=stream_calibration,
         )
         budget["remaining_weights"].update(
             {key: preparation[key] for key in ("tensor_bytes", "effective_bpw")}
@@ -586,6 +588,7 @@ def prepare_affine_conversion(
     calib_dataset=None,
     sensitivity_calib_dataset=None,
     progress_callback,
+    stream_calibration=None,
 ):
     from ...oq import (
         _OQE_CALIB_DATASET,
@@ -630,6 +633,22 @@ def prepare_affine_conversion(
             / ".oqe_imatrix"
             / f"{source.name}-oQe-s{imatrix_num_samples}-l{imatrix_seq_length}.npz"
         )
+    stream_calibration = (
+        True if stream_calibration is None else bool(stream_calibration)
+    )
+    if stream_calibration and calibration_source != source:
+        logger.warning(
+            "V4.1 streaming calibration reads the original source checkpoint; "
+            "sensitivity_model_path is ignored"
+        )
+    sensitivity_config = {
+        **config,
+        "num_hidden_layers": config.get("text_config", config).get("num_hidden_layers")
+        or config.get("text_config", config).get("n_layers", 0),
+    }
+    sensitivity = _normalize_sensitivity_map_override(
+        sensitivity_config, sensitivity_map_override
+    )
     imatrix = _load_or_collect_imatrix(
         str(source),
         signed_config,
@@ -644,44 +663,68 @@ def prepare_affine_conversion(
         progress_start=1,
         progress_end=10,
         load_path_factory=lambda: str(calibration_source),
+        stream_calibration=stream_calibration,
+        measure_sensitivity=(stream_calibration and sensitivity is None),
+        sensitivity_oq_level=_base_bits_for_level(oq_level),
+        sensitivity_calib_dataset=sensitivity_calib_dataset,
+        sensitivity_num_samples=32,
+        sensitivity_seq_length=256,
     )
     coverage = imatrix.metadata.get("expert_coverage", {})
-    sensitivity_config = {
-        **config,
-        "num_hidden_layers": config.get("text_config", config).get("num_hidden_layers")
-        or config.get("text_config", config).get("n_layers", 0),
-    }
-    sensitivity = _normalize_sensitivity_map_override(
-        sensitivity_config, sensitivity_map_override
-    )
+    streamed_sensitivity = None
+    collection = imatrix.metadata.get("collection")
+    if isinstance(collection, dict):
+        raw_sensitivity = collection.get("sensitivity_map")
+        if isinstance(raw_sensitivity, dict):
+            streamed_sensitivity = {
+                int(layer): float(score)
+                for layer, score in raw_sensitivity.items()
+            }
+    if sensitivity is None and streamed_sensitivity:
+        sensitivity = streamed_sensitivity
     if sensitivity is None:
         _emit_progress(
             progress_callback, "sensitivity", 10, "Measuring V4.1 layer distortion"
         )
-        model, processor = load(calibration_source, engram_ssd_offload=True)
-        try:
+        if stream_calibration:
+            from .calibration import measure_sensitivity_streaming
 
-            def progress(phase, done, total):
-                start, span = (10, 3) if phase == "capture" else (13, 7)
-                _emit_progress(
-                    progress_callback,
-                    "sensitivity",
-                    start + span * done / total,
-                    f"V4.1 {phase} {done}/{total}",
-                )
-
-            sensitivity = measure_sensitivity(
-                model,
-                processor.tokenizer,
+            sensitivity = measure_sensitivity_streaming(
+                str(source),
+                config,
                 bits=_base_bits_for_level(oq_level),
                 calib_dataset=sensitivity_calib_dataset,
-                progress=progress,
+                num_samples=32,
+                seq_length=256,
+                progress_callback=progress_callback,
+                progress_start=10,
+                progress_end=20,
             )
-        finally:
-            model.close()
-            del model, processor
-            mx.synchronize()
-            mx.clear_cache()
+        else:
+            model, processor = load(calibration_source, engram_ssd_offload=True)
+            try:
+
+                def progress(phase, done, total):
+                    start, span = (10, 3) if phase == "capture" else (13, 7)
+                    _emit_progress(
+                        progress_callback,
+                        "sensitivity",
+                        start + span * done / total,
+                        f"V4.1 {phase} {done}/{total}",
+                    )
+
+                sensitivity = measure_sensitivity(
+                    model,
+                    processor.tokenizer,
+                    bits=_base_bits_for_level(oq_level),
+                    calib_dataset=sensitivity_calib_dataset,
+                    progress=progress,
+                )
+            finally:
+                model.close()
+                del model, processor
+                mx.synchronize()
+                mx.clear_cache()
     inventory = projection_inventory(source, config, mapping, preserve_mtp=preserve_mtp)
     allocation, report = build_affine_plan(
         inventory,
@@ -698,7 +741,8 @@ def prepare_affine_conversion(
         imatrix_cache_reused=imatrix.reused,
         expert_coverage=coverage,
         sensitivity=sensitivity,
-        calibration_model=str(calibration_source),
+        calibration_model=str(source if stream_calibration else calibration_source),
+        calibration_streaming=stream_calibration,
         calib_dataset=calib_dataset,
         sensitivity_calib_dataset=sensitivity_calib_dataset,
         uncalibrated_policy="preserve_source_precision",

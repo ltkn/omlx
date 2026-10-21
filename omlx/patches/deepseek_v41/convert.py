@@ -188,9 +188,19 @@ def strip_draft_config(config):
             values["dspark_target_layer_ids"] = []
 
 
-def iter_source_weights(source, config, mapping, *, preserve_mtp=False):
-    """Repack one projection at a time for either direct loading or export."""
+def iter_source_weights(
+    source, config, mapping, *, preserve_mtp=False, key_filter=None
+):
+    """Repack one projection at a time for either direct loading or export.
+
+    ``key_filter`` limits the walk to a subset of the source mapping (a
+    single decoder layer, or the embedding table). It is applied before any
+    shard is opened, so a filtered walk never reads the rest of the
+    checkpoint. Offline conversion leaves it unset.
+    """
     source = Path(source)
+    if key_filter is not None:
+        mapping = {key: value for key, value in mapping.items() if key_filter(key)}
     # Sorted mlx_lm indexes put biases before weights.
     # Claim metadata first so only its weight emits it.
     readers, consumed = (

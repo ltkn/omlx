@@ -110,7 +110,7 @@ Models that are already MLX-quantized cannot be used as a source.
 
 Some models have their own rules:
 
-- **DeepSeek V4.1:** oQ3, oQ3e, oQ4 and oQ4e with bfloat16 output, from the original checkpoint. oQ4 keeps the original FP4/FP8 projection precision and quantizes the Engram tables to 4-bit.
+- **DeepSeek V4.1:** oQ2.5, oQ2.5e, oQ3, oQ3e, oQ4 and oQ4e with bfloat16 output, from the original checkpoint. oQ4 keeps the original FP4/FP8 projection precision and quantizes the Engram tables to 4-bit by default; `ngram_bits` selects 2, 3, 4, 6 or 8 bits. oQ2.5/oQ2.5e and oQ3/oQ3e calibrate one decoder block at a time from the original shards by default, so the full 300+ GB non-Engram source is never resident at once. Passing `stream_calibration=False` restores the full-model calibration path. Existing V4.1 imatrix caches collected on the real source are reused; if such a cache has no sensitivity scores, the scores are measured with the same streamed block walk.
 - **DeepSeek V4:** float16 output is not supported.
 
 ## Benchmarks
