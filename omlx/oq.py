@@ -307,8 +307,8 @@ def _validate_v41_oq_settings(oq_level, dtype="bfloat16", group_size=64):
         raise ValueError(
             f"DeepSeek V4.1 does not support oQ{oq_level:g}/oQ{oq_level:g}e. "
             "Choose oQ2, oQ2.5, oQ2.7, oQ3 or oQ4, with or without e. oQ4 "
-            "preserves the original FP4/FP8 projection precision, and every "
-            "level quantizes Engram tables to 4 bits."
+            "preserves the original FP4/FP8 projection precision. Every "
+            "level quantizes Engram tables to 4 bits by default."
         )
     if dtype != "bfloat16" or group_size != 64:
         raise ValueError(
@@ -3510,6 +3510,7 @@ def estimate_bpw_and_size(
     oq_level: int,
     group_size: int = 64,
     preserve_mtp: bool = False,
+    ngram_bits: int | None = None,
 ) -> dict:
     """Calculate precise effective bpw and output size by scanning actual tensors.
 
@@ -3523,6 +3524,8 @@ def estimate_bpw_and_size(
             argument in ``quantize_oq_streaming``.
         oq_level: Target oQ level (base bits).
         group_size: Quantization group size.
+        ngram_bits: Optional N-gram/Engram table override, mirroring the
+            matching argument in ``quantize_oq_streaming``.
 
     Returns:
         Dict with effective_bpw, output_size_bytes, output_size_formatted.
@@ -3531,6 +3534,14 @@ def estimate_bpw_and_size(
     config_path = source / "config.json"
     with open(config_path) as f:
         config = json.load(f)
+
+    if ngram_bits is not None:
+        if int(ngram_bits) not in _VALID_QUANT_BITS:
+            raise ValueError(
+                f"Invalid ngram_bits {ngram_bits!r}. "
+                f"Must be one of {_VALID_QUANT_BITS}"
+            )
+        config["_oq_ngram_bits"] = int(ngram_bits)
 
     weight_files = _source_weight_files(source)
     if not weight_files:
@@ -3552,6 +3563,8 @@ def estimate_bpw_and_size(
         _validate_v41_oq_settings(oq_level, group_size=group_size)
         if "omlx_deepseek_v41" in config:
             raise ValueError("V4.1 quantization requires the original checkpoint")
+        if ngram_bits is not None and int(ngram_bits) not in (2, 3, 4, 6, 8):
+            raise ValueError("V4.1 Engram bits must be one of 2, 3, 4, 6 or 8")
         mapping = json.loads((source / "model.safetensors.index.json").read_text())[
             "weight_map"
         ]
@@ -3560,7 +3573,9 @@ def estimate_bpw_and_size(
             config,
             mapping,
             preserve_mtp=preserve_mtp,
-            engram_bits=_offload_table_bits(oq_level),
+            engram_bits=(
+                _offload_table_bits(oq_level) if ngram_bits is None else int(ngram_bits)
+            ),
         )
         remaining = budget["remaining_weights"]
         # Allocations below oQ4 are not known until calibration. Quote their
@@ -6474,17 +6489,19 @@ def quantize_oq_streaming(
         calib_dataset: Calibration corpus for the oQe imatrix pass.
             Accepts a built-in name (default ``"oqe_code_multilingual"``),
             an HF dataset name, or a path to a .txt file / directory of
-            .txt files (e.g. a custom corpus bundle). Only used when
-            enhanced is True; the imatrix cache key includes a content
-            hash of custom paths so corpus edits invalidate stale caches.
+            .txt files (e.g. a custom corpus bundle). Used when enhanced
+            is True, and by the DeepSeek V4.1 calibration pass even without
+            enhanced because its allocator needs expert coverage. The
+            imatrix cache key includes a content hash of custom paths so
+            corpus edits invalidate stale caches.
         sensitivity_calib_dataset: Calibration corpus for layer
             sensitivity measurement (default ``"code_multilingual"``).
             Same accepted values as calib_dataset.
-        ngram_bits: Bit width for the qwen4_exp N-gram PLE table
-            (default: the selected oQ level, e.g. Q4 at oQ4e). Pass 8 to
-            keep the table at Q8 group-32 affine while the rest of the
-            model follows the oQ level. No effect on other model types.
-            Cannot be combined with preserve_ngram_table.
+        ngram_bits: Bit width for the qwen4_exp N-gram PLE table, or the
+            DeepSeek V4.1 Engram tables (default: the selected oQ level,
+            at least 4 bits, e.g. Q4 at oQ4e). Pass 8 to keep the table at
+            Q8 group-32 affine while the rest of the model follows the oQ
+            level. Cannot be combined with preserve_ngram_table.
     """
     if oq_level not in OQ_LEVELS:
         raise ValueError(
@@ -6538,15 +6555,6 @@ def quantize_oq_streaming(
         and not text_only
     )
     if normalized_model_type == "deepseek_v41":
-        if (
-            calib_dataset is not None
-            or sensitivity_calib_dataset is not None
-            or ngram_bits is not None
-        ):
-            raise ValueError(
-                "calib_dataset, sensitivity_calib_dataset and ngram_bits are "
-                "not supported on the deepseek_v41 quantization path"
-            )
         from .patches.deepseek_v41.oq import quantize as quantize_v41
 
         return quantize_v41(
@@ -6567,6 +6575,9 @@ def quantize_oq_streaming(
             hard_cap_bpw=hard_cap_bpw,
             text_only=text_only,
             dtype=dtype,
+            calib_dataset=calib_dataset,
+            sensitivity_calib_dataset=sensitivity_calib_dataset,
+            ngram_bits=ngram_bits,
             progress_callback=progress_callback,
         )
     if (
@@ -7399,6 +7410,7 @@ def quantize_oq_streaming(
         "_oq_non_quantizable",
         "_oq_noncausal_attention",
         "_oq_imatrix_capture_skip",
+        "_oq_ngram_bits",
     ):
         output_config.pop(temp_key, None)
     if text_only:
