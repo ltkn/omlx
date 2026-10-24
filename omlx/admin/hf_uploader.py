@@ -27,6 +27,7 @@ from ..oq import (
     _is_qwen4_exp_ngram_embedding_tensor,
     _is_vision_tensor,
 )
+from ..patches.minimax_m3_dspark import bundled_dspark_path
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +135,11 @@ def _quantization_specs(config: dict) -> tuple[dict, dict]:
     return default, {k: v for k, v in quant.items() if isinstance(v, dict)}
 
 
+def _word_bits(weight: dict) -> int:
+    """MLX packs quantized weights into uint32; V4.1 FP8 tables keep raw bytes."""
+    return 32 if weight["dtype"] == "U32" else 8
+
+
 def _storage_format(
     spec: dict, weight: dict, scales: dict, has_biases: bool
 ) -> tuple[str, int]:
@@ -141,9 +147,9 @@ def _storage_format(
     mode = spec.get("mode") or ("affine" if has_biases else None)
     group = spec.get("group_size") or _MX_GROUP_SIZES.get(mode or "")
     group = group or (64 if has_biases else 32)
-    # Each uint32 word packs 32 / bits weights, and each scale covers a group.
+    # Each word packs word_bits / bits weights, and each scale covers a group.
     bits = spec.get("bits") or round(
-        weight["shape"][-1] * 32 / (scales["shape"][-1] * group)
+        weight["shape"][-1] * _word_bits(weight) / (scales["shape"][-1] * group)
     )
     mode = mode or f"mxfp{bits}"
     if mode == "affine":
@@ -197,10 +203,12 @@ def _storage_summary(model_path: Path, config: dict) -> tuple[dict, dict]:
             label, bits = _storage_format(
                 {**default, **modules.get(module, {})}, info, scales, biases is not None
             )
-            weights = math.prod(info["shape"]) * 32 // bits
+            weights = math.prod(info["shape"]) * _word_bits(info) // bits
             stored = info["bytes"] + scales["bytes"] + (biases or {}).get("bytes", 0)
             if component in _LOOKUP_TABLES:
-                label = f"{component.split()[0]} {label[0].lower()}{label[1:]}"
+                if not label[1].isupper():
+                    label = label[0].lower() + label[1:]
+                label = f"{component.split()[0]} {label}"
         else:
             weights = math.prod(info["shape"])
             stored = info["bytes"]
@@ -228,13 +236,28 @@ def _generate_model_card(
     total_w = max(sum(row[0] for row in formats.values()), 1)
     total_b = sum(row[1] for row in formats.values())
     gib = 1024**3
+    # A bundled DSpark draft keeps its own config and shards in a subfolder.
+    draft = bundled_dspark_path(model_path)
+    draft_w = draft_b = 0
+    if draft is not None:
+        draft_formats, _ = _storage_summary(
+            draft, json.loads((draft / "config.json").read_text())
+        )
+        draft_w = sum(row[0] for row in draft_formats.values())
+        draft_b = sum(row[1] for row in draft_formats.values())
 
-    tags = ["mlx", "oq", "quantized"] + (["mtp"] if "MTP head" in components else [])
+    has_mtp = "MTP head" in components or draft is not None
+    tags = ["mlx", "oq", "quantized"] + (["mtp"] if has_mtp else [])
     lines = ["---", "library_name: mlx", "tags:", *(f"- {tag}" for tag in tags)]
     lines += ["---", "", f"# {model_name}", ""]
     if redownload_notice:
         today = date.today().isoformat()
         lines += [_REDOWNLOAD_NOTICE.format(date=today, version=__version__), ""]
+    engram = list(
+        ((config.get("omlx_deepseek_v41") or {}).get("engram_tables") or {}).values()
+    )
+    if engram and all(table.get("mode") == "mxfp8" for table in engram):
+        lines += ["N-gram (Engram) tables are kept at the original FP8 precision.", ""]
     lines += [
         "This model was quantized using [oQ](https://github.com/jundot/omlx) "
         f"(oMLX v{__version__}) mixed-precision quantization.",
@@ -242,6 +265,13 @@ def _generate_model_card(
     ]
 
     average = f"{8 * total_b / total_w:.3f} bits/weight"
+    scope = "the complete checkpoint" if draft is None else "the model weights"
+    with_draft = (
+        ""
+        if draft is None
+        else f", or {8 * (total_b + draft_b) / (total_w + draft_w):.3f} "
+        "bits/weight including the DSpark draft"
+    )
     tables = [name for name in _LOOKUP_TABLES if name in components]
     if tables:
         table_w = sum(components[name][0] for name in tables)
@@ -250,11 +280,11 @@ def _generate_model_card(
         lines.append(
             "The effective average is "
             f"{8 * (total_b - table_b) / max(total_w - table_w, 1):.3f} "
-            f"bits/weight excluding {excluded}, or {average} for the complete "
-            "checkpoint."
+            f"bits/weight excluding {excluded}, or {average} for {scope}"
+            f"{with_draft}."
         )
     else:
-        lines.append(f"The effective average is {average} for the complete checkpoint.")
+        lines.append(f"The effective average is {average} for {scope}{with_draft}.")
 
     lines += [
         "",
@@ -291,16 +321,20 @@ def _generate_model_card(
         "| Component | Logical weights | Storage |",
         "|---|---|---|",
     ]
-    for name in _COMPONENT_ORDER:
-        if name in components:
-            weights, stored = components[name]
-            lines.append(
-                f"| {name} | {weights / 1e9:.3f}B | "
-                f"{stored / 1e9:.3f} GB / {stored / gib:.3f} GiB |"
-            )
+    parts = [
+        (name, *components[name]) for name in _COMPONENT_ORDER if name in components
+    ]
+    if draft is not None:
+        parts.append(("DSpark draft (MTP)", draft_w, draft_b))
+    for name, weights, stored in parts:
+        lines.append(
+            f"| {name} | {weights / 1e9:.3f}B | "
+            f"{stored / 1e9:.3f} GB / {stored / gib:.3f} GiB |"
+        )
+    all_w, all_b = total_w + draft_w, total_b + draft_b
     lines.append(
-        f"| **Total** | **{total_w / 1e9:.3f}B** | "
-        f"**{total_b / 1e9:.3f} GB / {total_b / gib:.3f} GiB** |"
+        f"| **Total** | **{all_w / 1e9:.3f}B** | "
+        f"**{all_b / 1e9:.3f} GB / {all_b / gib:.3f} GiB** |"
     )
     return "\n".join(lines) + "\n"
 
