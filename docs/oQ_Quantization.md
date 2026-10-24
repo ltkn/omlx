@@ -84,6 +84,7 @@ Sample selection uses a fixed seed, so repeated runs on the same model see the s
 | Enhanced quantization (oQe) | Uses the imatrix when rounding. Recommended |
 | Text Only | Leaves out the vision encoder of a vision-language model and writes a text-only model |
 | Preserve MTP weights | Keeps the MTP heads so Lightning MTP works after quantization. Adds `-mtp` to the name |
+| Keep original Engram tables | DeepSeek V4.1 only. Copies the Engram tables in their original FP8 storage instead of 4-bit. The output is larger on disk, and memory use with SSD N-gram Offload stays the same. Adds `-ngram` to the name |
 | Combine other model's MTP head | Grafts an MTP head from another checkpoint of the same architecture, or a Gemma 4 assistant model, into the output |
 | Non-quant weight dtype | bfloat16 (default) or float16 for unquantized weights and quantization scales. float16 adds `-fp16` to the name |
 | Sensitivity Model | Measures sensitivity on an already quantized copy of the model to use about 4x less memory |
@@ -110,7 +111,7 @@ Models that are already MLX-quantized cannot be used as a source.
 
 Some models have their own rules:
 
-- **DeepSeek V4.1:** oQ2.5, oQ2.5e, oQ3, oQ3e, oQ4 and oQ4e with bfloat16 output, from the original checkpoint. oQ4 keeps the original FP4/FP8 projection precision and quantizes the Engram tables to 4-bit by default; `ngram_bits` selects 2, 3, 4, 6 or 8 bits. oQ2.5/oQ2.5e and oQ3/oQ3e calibrate one decoder block at a time from the original shards by default, so the full 300+ GB non-Engram source is never resident at once. Passing `stream_calibration=False` restores the full-model calibration path. Existing V4.1 imatrix caches collected on the real source are reused; if such a cache has no sensitivity scores, the scores are measured with the same streamed block walk.
+- **DeepSeek V4.1:** oQ2.5, oQ2.5e, oQ3, oQ3e, oQ4 and oQ4e with bfloat16 output, from the original checkpoint. oQ4 keeps the original FP4/FP8 projection precision and quantizes the Engram tables to 4-bit by default; `ngram_bits` selects 2, 3, 4, 6 or 8 bits, while `preserve_ngram_table` copies the official FP8 tables unchanged (the UI's "Keep original Engram tables"). oQ2.5/oQ2.5e and oQ3/oQ3e calibrate one decoder block at a time from the original shards by default, so the full 300+ GB non-Engram source is never resident at once. Passing `stream_calibration=False` restores the full-model calibration path. Existing V4.1 imatrix caches collected on the real source are reused; if such a cache has no sensitivity scores, the scores are measured with the same streamed block walk.
 - **DeepSeek V4:** float16 output is not supported.
 
 ## Benchmarks
