@@ -354,7 +354,7 @@ class ModelSettingsRequest(BaseModel):
     model_alias: str | None = None
     model_type_override: str | None = None
     max_context_window: int | None = None
-    max_tokens: int | None = None
+    max_tokens: int | None = Field(default=None, ge=1)
     temperature: float | None = None
     top_p: float | None = None
     top_k: int | None = None
@@ -733,7 +733,7 @@ class GlobalSettingsRequest(BaseModel):
     # Sampling defaults
     sampling_max_context_window: int | None = None
     sampling_max_context_window_policy: int | None = Field(default=None, ge=1)
-    sampling_max_tokens: int | None = None
+    sampling_max_tokens: int | None = Field(default=None, ge=1)
     sampling_temperature: float | None = None
     sampling_top_p: float | None = None
     sampling_top_k: int | None = None
@@ -3220,70 +3220,17 @@ async def update_model_settings(
     if "mtp_enabled" in sent:
         new_mtp_enabled = False if is_diffusion_model else bool(request.mtp_enabled)
         if new_mtp_enabled:
-            # Compatibility check: the model needs MTP heads in config.json AND
-            # the model_type must be one PR 990 / PR 15 covers AND the weight
-            # files must actually contain MTP tensors (mtp.* or the native
-            # nextn layers). The last check is the one that catches
-            # mlx-community converted weights where the default sanitize
-            # path stripped the MTP heads.
-            import json
-            from pathlib import Path
-
-            from ..utils.model_loading import (
-                _checkpoint_has_mtp_weights,
-                _is_mtp_compatible,
+            # Same gate as the toggle status in the model list, which also
+            # accepts MiniMax M3.1 through its bundled dspark/ draft.
+            compat_ok, compat_reason = _mtp_compat_for_model(
+                {
+                    "model_path": entry.model_path,
+                    "config_model_type": entry.config_model_type,
+                    "engine_type": entry.engine_type,
+                }
             )
-
-            cfg_path = Path(entry.model_path) / "config.json"
-            if not cfg_path.exists():
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"MTP enabled but config.json missing at {cfg_path}; "
-                        "cannot verify MTP compatibility."
-                    ),
-                )
-            try:
-                cfg = json.loads(cfg_path.read_text())
-            except Exception as e:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"MTP enabled but failed to read model config: {e}",
-                )
-            model_type = cfg.get("model_type")
-            # qwen4_exp routes through the dedicated VLM Lightning MTP path
-            # (see _mtp_compat_for_model); skip the mlx-lm whitelist here but
-            # keep the mtp.* weight check below.
-            if model_type != "qwen4_exp" and not _is_mtp_compatible(cfg, model_type):
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"Model is not MTP-compatible (model_type={model_type!r}, "
-                        f"mtp_num_hidden_layers={cfg.get('mtp_num_hidden_layers', 0)}). "
-                        "Lightning MTP requires a Qwen3.5/3.6, DeepSeek-V4, "
-                        "GLM-5.2, or merged-assistant Gemma 4 checkpoint with "
-                        "MTP heads."
-                    ),
-                )
-            if not _checkpoint_has_mtp_weights(entry.model_path):
-                if model_type == "qwen4_exp":
-                    raise HTTPException(
-                        status_code=400,
-                        detail=(
-                            "Qwen4-Exp Lightning MTP requires embedded mtp.* "
-                            "tensors; native nextn layers are not supported by "
-                            "its dedicated runtime."
-                        ),
-                    )
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "Config declares MTP layers but the weight files contain "
-                        "neither mtp.* tensors nor native nextn layers. Re-convert "
-                        "from HF with a converter that preserves MTP weights. The "
-                        "default mlx-lm sanitize() path strips them."
-                    ),
-                )
+            if not compat_ok:
+                raise HTTPException(status_code=400, detail=compat_reason)
             # Mutual exclusion with DFlash — ModelSettings.__post_init__
             # also enforces this, but we surface a clearer error here.
             dflash_after = (

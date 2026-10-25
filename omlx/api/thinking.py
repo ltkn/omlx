@@ -177,6 +177,14 @@ def extract_thinking(
     With ``truncated=True``, unfinished thinking stays in the thinking channel,
     including a block the prompt opened (``start_in_thinking``).
 
+    With ``start_in_thinking=True`` the prompt already opened the thinking
+    block, so text before the first tag is thinking, exactly as
+    ``ThinkingParser(start_in_thinking=True)`` treats a stream. Decoded
+    engine text normally carries no opener in that case, because the
+    scheduler prepends its synthetic ``<think>`` to the first streamed chunk
+    rather than to the completion text; an opener that is present is kept
+    and not duplicated.
+
     Other tag-free text is always classified as content. Mirrors
     ``ThinkingParser.finish()`` recovery semantics (`_content_emitted`
     fallback): when the model emits no thinking markers, surface the body
@@ -205,13 +213,8 @@ def extract_thinking(
         .replace(_HY3_CLOSE_TAG, _CLOSE_TAG)
     )
 
-    if (
-        truncated
-        and start_in_thinking
-        and _OPEN_TAG not in text
-        and _CLOSE_TAG not in text
-    ):
-        return (text.strip(), "")
+    if start_in_thinking and not text.lstrip().startswith(_OPEN_TAG):
+        text = _OPEN_TAG + text
 
     if leading_only:
         return _extract_leading_thinking(text, truncated, start_in_thinking)
@@ -261,6 +264,10 @@ def _extract_leading_thinking(
     body = text.lstrip()
     if body.startswith(_OPEN_TAG):
         body = body[_OPEN_LEN:]
+    elif body.startswith(_CLOSE_TAG):
+        # The model skipped thinking and wrote only the close tag, which
+        # ThinkingParser drops before the answer too.
+        return ("", body[_CLOSE_LEN:].strip())
     elif not start_in_thinking:
         return ("", text)
     end = body.find(_CLOSE_TAG)

@@ -680,6 +680,11 @@ class DFlashDrafter:
         )
         inputs = mx.concatenate([anchors[:, None], masks], axis=1)
         h = model._embed_input_tokens(inputs)
+        # An fp16 drafter keeps its residual stream and its output convolutions
+        # in fp32: on the Qwen3.8 DFlash2 drafter the residual reaches 1.6e5 and
+        # the last MLP convolution 1.5e5, past fp16's 65504, while the
+        # normalized inputs of every projection stay small.
+        wide = dtype == mx.float16
         if self.mask_embedding is not None:
             fill = self.mask_embedding.astype(h.dtype)
             h = mx.concatenate(
@@ -687,6 +692,8 @@ class DFlashDrafter:
                 axis=1,
             )
 
+        if wide:
+            h = h.astype(mx.float32)
         cohort = self._assemble_cohort(uids, dtype)
         base_arr = mx.array(bases, dtype=mx.int32)
         if counts is None:
@@ -746,6 +753,8 @@ class DFlashDrafter:
             mlp_conv = getattr(layer, "mlp_conv", None)
             residual = h
             x = layer.input_layernorm(h)
+            if wide:
+                x = x.astype(dtype)
             if attention_conv is not None:
                 x, kernel = kernels.conv_prepare(attention_conv, x)
 
@@ -798,15 +807,21 @@ class DFlashDrafter:
             attended = attended.transpose(0, 2, 1, 3).reshape(batch, block, -1)
             attended = attn.o_proj(variants.gate_output(attn, x, attended))
             if attention_conv is not None:
+                if wide:
+                    attended = attended.astype(mx.float32)
                 attended = kernels.conv_finish(attention_conv, attended, kernel)
             h = residual + attended
 
             residual = h
             x = layer.post_attention_layernorm(h)
+            if wide:
+                x = x.astype(dtype)
             if mlp_conv is not None:
                 x, kernel = kernels.conv_prepare(mlp_conv, x)
             x = variants.gated_mlp(layer.mlp, x)
             if mlp_conv is not None:
+                if wide:
+                    x = x.astype(mx.float32)
                 x = kernels.conv_finish(mlp_conv, x, kernel)
             h = residual + x
 
@@ -821,6 +836,8 @@ class DFlashDrafter:
                 self._remember(row, h_ctx[index : index + 1, :n])
 
         draft_hidden = model.norm(h) if anchor_slot else model.norm(h)[:, 1:]
+        if wide:
+            draft_hidden = draft_hidden.astype(dtype)
         logits = model._logits(draft_hidden)
         samplers = [sampler for *_, sampler in rows]
         selector = getattr(model, "candidate_selector", None)

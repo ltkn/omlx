@@ -30,6 +30,7 @@ import functools
 import hashlib
 import importlib
 import inspect
+import itertools
 import json
 import logging
 import threading
@@ -2900,7 +2901,14 @@ class VLMBatchedEngine(BaseEngine):
                         get_mlx_executor(), _load_draft
                     )
                     self._engine.engine.scheduler.set_specprefill_draft_model(
-                        draft_model, draft_model_name=specprefill_draft
+                        draft_model,
+                        draft_model_name=specprefill_draft,
+                        keep_pct=getattr(
+                            self._model_settings, "specprefill_keep_pct", None
+                        ),
+                        threshold=getattr(
+                            self._model_settings, "specprefill_threshold", None
+                        ),
                     )
                     logger.info(
                         f"SpecPrefill: draft model loaded ({specprefill_draft})"
@@ -3433,9 +3441,48 @@ class VLMBatchedEngine(BaseEngine):
                         video_content.append({"type": "text", "text": item_text})
                 formatted_messages.append({"role": role, "content": video_content})
             else:
+                prompt: Any = content
+                parts: list[dict] = []
+                if isinstance(raw_content, list):
+                    parts = [
+                        (
+                            item
+                            if isinstance(item, dict)
+                            else {
+                                "type": getattr(item, "type", ""),
+                                "text": getattr(item, "text", ""),
+                            }
+                        )
+                        for item in raw_content
+                    ]
+                image_pos = [
+                    i for i, p in enumerate(parts) if p.get("type") in image_part_types
+                ][:msg_num_images]
+                # Text between images labels them, and flattening moves every
+                # image ahead of all text. Audio turns keep the flat layout
+                # because mlx-vlm keeps audio markers in the prefix.
+                if (
+                    msg_num_images > 1
+                    and msg_num_audios == 0
+                    and len(image_pos) == msg_num_images
+                    and extract_text_from_content(
+                        parts[image_pos[0] + 1 : image_pos[-1]]
+                    )
+                ):
+                    prompt = []
+                    for is_image, group in itertools.groupby(
+                        enumerate(parts),
+                        key=lambda ip: ip[1].get("type") in image_part_types,
+                    ):
+                        if is_image:
+                            prompt.extend(
+                                {"type": "image"} for i, _ in group if i in image_pos
+                            )
+                        elif text := extract_text_from_content([p for _, p in group]):
+                            prompt.append({"type": "text", "text": text})
                 formatted = get_message_json(
                     model_type,
-                    content,
+                    prompt,
                     role,
                     skip_image_token=role != "user" or msg_num_images == 0,
                     skip_audio_token=role != "user" or msg_num_audios == 0,

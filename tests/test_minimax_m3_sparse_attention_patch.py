@@ -296,8 +296,8 @@ def test_short_calls_fuse_mlp_gate_and_up_bit_exactly(language, monkeypatch, mod
         assert mx.array_equal(a, b).item()
 
 
-@pytest.mark.parametrize("rows", [3, 8])
-def test_short_row_mxfp8_matmul_matches_one_row_decode(language, rows):
+@pytest.mark.parametrize("rows", [2, 3, 8])
+def test_short_row_mxfp8_matmul_matches_one_row_decode(language, monkeypatch, rows):
     import mlx_vlm.models.minimax_m3_vl.qmv_rows as qmv_rows
 
     mx.random.seed(6)
@@ -306,7 +306,15 @@ def test_short_row_mxfp8_matmul_matches_one_row_decode(language, rows):
     )
     x = mx.random.normal((1, rows, 512)).astype(mx.bfloat16)
     expected = mx.concatenate([proj(x[:, i : i + 1]) for i in range(rows)], axis=1)
+    # MLX's multi-row kernel splits K differently and rounds a few outputs
+    # in ten thousand differently, so check the call takes the exact rows.
+    exact = qmv_rows.exact_rows_qmv
+    calls = []
+    monkeypatch.setattr(
+        qmv_rows, "exact_rows_qmv", lambda *a, **k: calls.append(1) or exact(*a, **k)
+    )
     assert mx.array_equal(qmv_rows.rows_linear(proj, x), expected).item()
+    assert calls
 
 
 def test_row_exact_verify_router_and_mxfp8_match_one_row_decode(language):
@@ -339,8 +347,9 @@ def test_row_exact_verify_router_and_mxfp8_match_one_row_decode(language):
     assert mx.array_equal(projected, expected_proj).item()
 
 
+@pytest.mark.parametrize("armed", [True, False])
 @pytest.mark.parametrize("rows", [2, 8])
-def test_row_exact_verify_dense_head_matches_one_row_decode(language, rows):
+def test_row_exact_verify_dense_head_matches_one_row_decode(language, rows, armed):
     import mlx_vlm.models.minimax_m3_vl.qmv_rows as qmv_rows
 
     from omlx.patches.qwen35_verify_qmm import set_verify_qmm_armed
@@ -350,7 +359,8 @@ def test_row_exact_verify_dense_head_matches_one_row_decode(language, rows):
     head.set_dtype(mx.bfloat16)
     x = mx.random.normal((1, rows, 6144)).astype(mx.bfloat16)
     expected = mx.concatenate([head(x[:, i : i + 1]) for i in range(rows)], axis=1)
-    set_verify_qmm_armed(True, row_exact=True)
+    # A decode batch (not armed) takes the one-row arithmetic too.
+    set_verify_qmm_armed(armed, row_exact=armed)
     try:
         projected = qmv_rows.rows_linear(head, x)
         mx.eval(projected)
@@ -502,7 +512,7 @@ def test_small_l_block_score_kernel_matches_numpy(language, length):
                         assert abs(got - expected) <= 1e-3 * max(1.0, abs(expected))
 
 
-def test_small_l_sparse_attention_kernel_matches_reference(language):
+def test_small_l_sparse_attention_kernel_matches_reference(language, monkeypatch):
     import mlx_vlm.models.minimax_m3_vl.msa as msa
 
     batch, heads, kv_heads, length, dim = 2, 8, 2, 8, 128
@@ -544,6 +554,24 @@ def test_small_l_sparse_attention_kernel_matches_reference(language):
         np.array(out.astype(mx.float32)), expected, atol=2e-2, rtol=2e-2
     )
 
+    # Spreading the query heads over more threads changes no bit (here out
+    # has one thread per key for all four heads of a KV head).
+    for heads_per_thread in (1, 2):
+        monkeypatch.setattr(msa, "_SMALL_L_HEADS_PER_THREAD", heads_per_thread)
+        spread = msa.small_l_sparse_attention(
+            q,
+            k,
+            v,
+            block_ids,
+            mx.array(qpos),
+            mx.array(pad),
+            block,
+            scale,
+            mx.array(keep),
+        )
+        assert mx.array_equal(spread, out).item()
+    monkeypatch.undo()
+
     # A verify row computes exactly like a one-token decode step, whatever
     # order the selection returns the blocks in.
     last = msa.small_l_sparse_attention(
@@ -558,3 +586,448 @@ def test_small_l_sparse_attention_kernel_matches_reference(language):
         mx.array(keep[:, :, -1:]),
     )
     assert mx.array_equal(last, out[:, :, -1:]).item()
+
+
+@pytest.mark.parametrize(
+    "shape", [(1, 1, 6144), (1, 7, 6144), (8, 128), (2, 1, 4, 128), (5, 4100)]
+)
+@pytest.mark.parametrize("out", ["model", "float32"])
+def test_decode_rms_norm_matches_mlx(language, shape, out):
+    import mlx_vlm.models.minimax_m3_vl.decode_kernels as dk
+
+    mx.random.seed(11)
+    x = (mx.random.normal(shape) * 3).astype(mx.bfloat16)
+    scale = 1.0 + mx.random.normal((shape[-1],)) * 0.3
+    dtype = x.dtype if out == "model" else mx.float32
+    y = dk.rms_norm(x, scale, 1e-6, dtype)
+    assert y is not None
+    expected = mx.fast.rms_norm(x, scale, 1e-6).astype(dtype)
+    assert mx.array_equal(y, expected).item()
+
+
+def test_decode_rms_norm_leaves_longer_calls_to_mlx(language):
+    import mlx_vlm.models.minimax_m3_vl.decode_kernels as dk
+
+    x = mx.zeros((9, 128), dtype=mx.bfloat16)
+    assert dk.rms_norm(x, mx.ones((128,)), 1e-6, mx.bfloat16) is None
+
+
+def test_rms_norm_caches_its_fp32_scale(language):
+    from mlx.utils import tree_flatten
+
+    norm = language.MiniMaxRMSNorm(64, eps=1e-6)
+    norm.weight = (mx.random.normal((64,)) * 0.3).astype(mx.bfloat16)
+    x = (mx.random.normal((2, 64)) * 3).astype(mx.bfloat16)
+    expected = mx.fast.rms_norm(x, norm.weight.astype(mx.float32) + 1, 1e-6)
+    assert mx.array_equal(norm(x), expected.astype(mx.bfloat16)).item()
+    assert mx.array_equal(norm(x, dtype=mx.float32), expected).item()
+    scale = norm._scale()
+    assert norm._scale() is scale
+    assert set(dict(tree_flatten(norm.parameters()))) == {"weight"}
+    # Loading a new weight array rebuilds the scale.
+    norm.weight = mx.zeros((64,), dtype=mx.bfloat16)
+    assert mx.array_equal(norm._scale(), mx.ones((64,))).item()
+
+
+def _head_inputs(batch, length):
+    heads = (64, 4, 4, 1)  # M3.1-Flash q, k, index q, index k
+    xs = [
+        (mx.random.normal((batch, length, h, 128)) * 3).astype(mx.bfloat16)
+        for h in heads
+    ]
+    return xs, [1.0 + mx.random.normal((128,)) * 0.3 for _ in heads]
+
+
+@pytest.mark.parametrize(
+    "batch,length,offset",
+    [
+        (1, 1, 4097),
+        (1, 1, [-3]),
+        (2, 1, [37, 50]),
+        (1, 4, 300),
+        # A left-padded prefill puts its padding at negative positions.
+        (2, 3, [-2, 5]),
+        (8, 1, [0, 1, 2, 3, 4, 5, 6, 7]),
+    ],
+)
+@pytest.mark.parametrize("dims,rope_scale", [(64, 1.0), (128, 1.0), (64, 0.25)])
+def test_decode_head_norm_rope_matches_mlx(
+    language, batch, length, offset, dims, rope_scale
+):
+    import mlx_vlm.models.minimax_m3_vl.decode_kernels as dk
+
+    mx.random.seed(13)
+    xs, scales = _head_inputs(batch, length)
+    if isinstance(offset, list):
+        offset = mx.array(offset)
+    rotated = dk.head_norm_rope(xs, scales, 1e-6, offset, dims, 1e7, rope_scale)
+    assert rotated is not None
+    for x, scale, y in zip(xs, scales, rotated):
+        normed = mx.fast.rms_norm(x, scale, 1e-6).transpose(0, 2, 1, 3)
+        expected = mx.fast.rope(
+            normed, dims, traditional=False, base=1e7, scale=rope_scale, offset=offset
+        ).astype(x.dtype)
+        assert mx.array_equal(y, expected).item()
+
+
+def test_decode_head_norm_rope_coverage(language):
+    import mlx_vlm.models.minimax_m3_vl.decode_kernels as dk
+
+    def covered(xs, scales, offset, dims):
+        return dk.head_norm_rope(xs, scales, 1e-6, offset, dims, 1e7, 1.0) is not None
+
+    xs, scales = _head_inputs(2, 4)
+    assert covered(xs, scales, mx.array([3, 0]), 64)
+    assert not covered(_head_inputs(3, 3)[0], scales, 0, 64)
+    assert not covered(xs, scales, mx.array([1, 2, 3]), 64)
+    assert not covered(xs, scales, 0, 48)
+    assert not covered(xs, [s.astype(mx.bfloat16) for s in scales], 0, 64)
+
+
+def test_short_calls_fuse_head_norms_and_rope_bit_exactly(language, monkeypatch):
+    import mlx_vlm.models.minimax_m3_vl.decode_kernels as dk
+
+    mx.random.seed(9)
+    args = _tiny_args(
+        head_dim=128, rotary_dim=64, rope_theta=1e7, sparse={"sparse_index_dim": 128}
+    )
+    attention = language.MiniMaxAttention(args, 0)
+    for name in ("q_norm", "k_norm", "index_q_norm", "index_k_norm"):
+        attention[name].weight = mx.random.normal((128,)) * 0.3
+    attention.set_dtype(mx.bfloat16)
+    prompt = mx.random.normal((1, 40, 64)).astype(mx.bfloat16)
+    steps = [mx.random.normal((1, n, 64)).astype(mx.bfloat16) for n in (1, 3, 8)]
+
+    def run():
+        outs, caches = [], []
+        for n in (37, 40):
+            cache = language.MiniMaxM3KVCache()
+            outs.append(attention(prompt[:, :n], mask="causal", cache=cache))
+            for step in steps:
+                outs.append(attention(step, cache=cache))
+                cache.trim(step.shape[1])
+            caches.append(cache)
+        batch = language.MiniMaxM3BatchKVCache.merge(caches)
+        outs.append(
+            attention(
+                mx.concatenate([steps[0], steps[0]]),
+                mask=batch.make_mask(1),
+                cache=batch,
+                position_ids=mx.array([[37], [40]]),
+            )
+        )
+        mx.eval(outs)
+        return outs
+
+    calls = []
+    head_norm_rope = dk.head_norm_rope
+
+    def spy(xs, *args):
+        calls.append(xs[0].shape[:2])
+        return head_norm_rope(xs, *args)
+
+    monkeypatch.setattr(dk, "head_norm_rope", spy)
+    fused = run()
+    assert calls == [(1, 1), (1, 3), (1, 8)] * 2 + [(2, 1)]
+    monkeypatch.setattr(dk, "head_norm_rope", lambda *args: None)
+    separate = run()
+    for a, b in zip(separate, fused):
+        assert mx.array_equal(a, b).item()
+
+
+@pytest.mark.parametrize("rows", [1, 3, 8])
+def test_decode_router_logits_match_one_row_matmul(language, rows):
+    import mlx_vlm.models.minimax_m3_vl.decode_kernels as dk
+
+    mx.random.seed(17)
+    weight = mx.random.normal((128, 6144)) * 0.02
+    x = (mx.random.normal((1, rows, 6144)) * 2).astype(mx.bfloat16)
+    logits = dk.moe_router_logits(x, weight)
+    assert logits is not None and logits.shape == (1, rows, 128)
+    for r in range(rows):
+        one = x[:, r : r + 1].astype(mx.float32) @ weight.T
+        assert mx.array_equal(logits[:, r : r + 1], one).item()
+    # Under 16 inputs per expert MLX's gemv splits K differently.
+    assert dk.moe_router_logits(x[..., :1024], weight[:, :1024]) is None
+
+
+@pytest.mark.parametrize("rows", [1, 2, 8])
+@pytest.mark.parametrize("down", [False, True])
+def test_decode_router_select_matches_moe_select(language, rows, down):
+    import mlx_vlm.models.minimax_m3_vl.decode_kernels as dk
+
+    rng = np.random.default_rng(rows)
+    logits = rng.normal(size=(1, rows, 128)).astype(np.float32) * 3
+    bias = rng.normal(size=128).astype(np.float32) * 0.1
+    # Five experts tie for the top; argpartition keeps the lower indices.
+    tied = [3, 10, 11, 12, 13]
+    logits[..., tied] = 8.0
+    bias[tied] = 1.0
+    logits, bias = mx.array(logits), mx.array(bias)
+    down_scale = mx.array(rng.uniform(0.5, 2.0, 128).astype(np.float32))
+    routed = dk.moe_router_select(logits, bias, 4, 2.0, down_scale if down else None)
+    assert routed is not None
+    inds, weights = language._minimax_moe_select(logits, bias, 4, 2.0, "sigmoid")
+    if down:
+        weights = weights * down_scale[inds]
+    assert inds[0, 0].tolist() == [3, 10, 11, 12]
+    assert mx.array_equal(routed[0], inds).item()
+    assert mx.array_equal(routed[1], weights).item()
+
+
+def _moe_block(language, experts=64, hidden=1024, inter=64):
+    args = _tiny_args(
+        hidden_size=hidden,
+        intermediate_size=inter,
+        shared_intermediate_size=inter,
+        num_local_experts=experts,
+        pack_shared_expert=False,
+        routed_expert_scales=True,
+    )
+    block = language.MiniMaxSparseMoeBlock(args)
+    block.gate.weight = mx.random.normal((experts, hidden)) * 0.05
+    block.e_score_correction_bias = mx.random.normal((experts,)) * 0.1
+    switch = block.switch_mlp
+    switch.gate_scale = mx.random.uniform(0.5, 4.0, (experts,))
+    switch.up_scale = mx.random.uniform(0.5, 4.0, (experts,))
+    switch.down_scale = mx.random.uniform(0.5, 2.0, (experts,))
+    return block
+
+
+@pytest.mark.parametrize("rows,armed", [(1, False), (3, True)])
+def test_short_calls_route_bit_exactly(language, monkeypatch, rows, armed):
+    import mlx_vlm.models.minimax_m3_vl.decode_kernels as dk
+
+    from omlx.patches.qwen35_verify_qmm import set_verify_qmm_armed
+
+    mx.random.seed(23)
+    block = _moe_block(language)
+    x = mx.random.normal((1, rows, 1024)).astype(mx.bfloat16)
+
+    def run():
+        set_verify_qmm_armed(armed, row_exact=armed)
+        try:
+            y = block(x)
+            mx.eval(y)
+        finally:
+            set_verify_qmm_armed(False)
+        return y
+
+    used = []
+
+    def spy(name):
+        fn = getattr(dk, name)
+
+        def call(*args):
+            used.append(name)
+            return fn(*args)
+
+        monkeypatch.setattr(dk, name, call)
+
+    spy("moe_router_logits")
+    spy("moe_router_select")
+    fused = run()
+    assert used == ["moe_router_logits", "moe_router_select"]
+    monkeypatch.setattr(dk, "moe_router_select", lambda *args: None)
+    assert mx.array_equal(run(), fused).item()
+
+
+def test_batched_rows_route_on_one_row_logits(language, monkeypatch):
+    import mlx_vlm.models.minimax_m3_vl.decode_kernels as dk
+
+    mx.random.seed(43)
+    block = _moe_block(language)
+    x = mx.random.normal((3, 1, 1024)).astype(mx.bfloat16)
+    seen = []
+    select = dk.moe_router_select
+
+    def spy(logits, *args):
+        seen.append(logits)
+        return select(logits, *args)
+
+    monkeypatch.setattr(dk, "moe_router_select", spy)
+    mx.eval(block(x))
+    expected = [block.gate(x[i : i + 1].astype(mx.float32)) for i in range(3)]
+    assert mx.array_equal(seen[0], mx.concatenate(expected)).item()
+
+
+def _quantized_moe_block(language):
+    block = _moe_block(language, experts=16, inter=512)
+    for module, spec in (
+        (block.switch_mlp, {"group_size": 16, "bits": 4, "mode": "nvfp4"}),
+        (block.shared_experts, {"group_size": 32, "bits": 8, "mode": "mxfp8"}),
+    ):
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            linear = module[name]
+            linear.weight = mx.random.normal(linear.weight.shape) * 0.05
+            module[name] = linear.to_quantized(**spec)
+    return block
+
+
+def test_one_token_experts_match_the_ops(language, monkeypatch):
+    import mlx_vlm.models.minimax_m3_vl.decode_kernels as dk
+
+    mx.random.seed(29)
+    block = _quantized_moe_block(language)
+    # Larger inputs push the SwiGLU-OAI gate and up values past the clip.
+    xs = [
+        (mx.random.normal((1, 1, 1024)) * scale).astype(mx.bfloat16)
+        for scale in (0.5, 2.0, 8.0)
+        for _ in range(8)
+    ]
+    calls = []
+    moe_experts = dk.moe_experts
+
+    def spy(*args):
+        y = moe_experts(*args)
+        calls.append(y is not None)
+        return y
+
+    monkeypatch.setattr(dk, "moe_experts", spy)
+    fused = [block(x) for x in xs]
+    assert calls == [True] * len(xs)
+    monkeypatch.setattr(dk, "moe_experts", lambda *args: None)
+    separate = [block(x) for x in xs]
+    monkeypatch.setattr(dk, "moe_experts", spy)
+    # The shared projections are now row views of their fused buffer.
+    again = [block(x) for x in xs]
+    mx.eval(fused, separate, again)
+    for a, b, c in zip(fused, separate, again):
+        assert mx.array_equal(a, b).item()
+        assert mx.array_equal(c, b).item()
+
+
+def test_one_token_experts_combine_in_mlx_order(language):
+    import mlx_vlm.models.minimax_m3_vl.decode_kernels as dk
+
+    mx.random.seed(31)
+    block = _quantized_moe_block(language)
+    switch, shared = block.switch_mlp, block.shared_experts
+    # Expert 1 copies expert 0 and their large opposite weights cancel, so
+    # the order of the FP32 sum over the experts shows in the rounded output.
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        for key in ("weight", "scales"):
+            bank = switch[name][key]
+            switch[name][key] = mx.concatenate([bank[:1], bank[:1], bank[2:]])
+    for key in ("gate_scale", "up_scale"):
+        scale = switch[key]
+        switch[key] = mx.concatenate([scale[:1], scale[:1], scale[2:]])
+    inds = mx.array([[[0, 1, 2, 3]]], dtype=mx.uint32)
+    weights = mx.array([[[1000.37, -1000.29, 0.53, 0.0071]]])
+    for scale in (0.5, 2.0, 8.0):
+        x = (mx.random.normal((1, 1, 1024)) * scale).astype(mx.bfloat16)
+        expected = language._combine_routed(switch(x, inds), weights) + shared(x)
+        y = dk.moe_experts(x, inds, weights, switch, shared)
+        assert y is not None
+        assert mx.array_equal(y, expected).item()
+
+
+@pytest.mark.parametrize("k,n", [(512, 64), (1024, 512), (2048, 8192)])
+def test_one_row_mxfp8_kernel_matches_quantized_matmul(language, k, n):
+    import mlx_vlm.models.minimax_m3_vl.decode_kernels as dk
+
+    mx.random.seed(59)
+    proj = nn.QuantizedLinear.from_linear(
+        nn.Linear(k, n, bias=False), group_size=32, bits=8, mode="mxfp8"
+    )
+    for scale in (0.5, 4.0):
+        x = (mx.random.normal((1, 1, k)) * scale).astype(mx.bfloat16)
+        y = dk.mxfp8_one_row(x, proj.weight, proj.scales)
+        assert y is not None
+        assert mx.array_equal(y, proj(x)).item()
+
+
+def test_decode_batch_affine_head_matches_one_row_decode(language, monkeypatch):
+    import mlx_vlm.models.minimax_m3_vl.qmv_rows as qmv_rows
+
+    mx.random.seed(61)
+    # As wide as a vocabulary head: a decode batch takes the row-exact tile.
+    head = nn.QuantizedLinear.from_linear(
+        nn.Linear(512, 65536, bias=False), group_size=64, bits=8
+    )
+    head.set_dtype(mx.bfloat16)
+    x = mx.random.normal((1, 3, 512)).astype(mx.bfloat16)
+    expected = mx.concatenate([head(x[:, i : i + 1]) for i in range(3)], axis=1)
+    tiled = qmv_rows.row_exact_qmv.quantized_linears_tiled
+    calls = []
+    monkeypatch.setattr(
+        qmv_rows.row_exact_qmv,
+        "quantized_linears_tiled",
+        lambda *a, **k: calls.append(1) or tiled(*a, **k),
+    )
+    assert mx.array_equal(qmv_rows.rows_linear(head, x), expected).item()
+    assert calls
+
+
+@pytest.mark.parametrize("blocks", [17, 40, 125, 1000, 4096])
+def test_block_selection_kernel_matches_argpartition(language, blocks):
+    import mlx_vlm.models.minimax_m3_vl.msa as msa
+
+    rng = np.random.default_rng(blocks)
+    # Few distinct values, so ties fall across the k-th boundary.
+    choices = np.array([-1e30, -1e29, -3.0, -2.0, -1.0, 0.0, np.inf], dtype=np.float32)
+    negated = mx.array(rng.choice(choices, size=(2, 4, 3, blocks)))
+    expected = mx.argpartition(negated, kth=15, axis=-1)[..., :16].astype(mx.int32)
+    selected = msa.small_l_select_blocks(negated, 16)
+    assert selected is not None
+    assert mx.array_equal(selected, expected).item()
+
+
+@pytest.mark.parametrize("length", [1, 5])
+def test_small_l_sparse_attention_staging_changes_no_bit(language, monkeypatch, length):
+    import mlx_vlm.models.minimax_m3_vl.msa as msa
+
+    # M3.1's layout: blocks as long as the head dimension, 16 query heads per
+    # KV head.
+    batch, heads, kv_heads, dim = 2, 32, 2, 128
+    total, block, topk = 1200, 128, 4
+    pad = np.array([45, 0], dtype=np.int32)
+    rng = np.random.default_rng(3)
+    q, k, v = (
+        mx.array(rng.standard_normal(shape).astype(np.float32)).astype(mx.bfloat16)
+        for shape in (
+            (batch, heads, length, dim),
+            (batch, kv_heads, total, dim),
+            (batch, kv_heads, total, dim),
+        )
+    )
+    keep = mx.array(rng.random((batch, 1, length, total)) > 0.1)
+    qpos = np.stack([np.arange(total - p - length, total - p) for p in pad]).astype(
+        np.int32
+    )
+    block_ids = mx.array(
+        np.stack(
+            [rng.permutation(qpos[b, -1] // block + 1)[:topk] for b in range(batch)]
+        )[:, None, None, :]
+        .repeat(kv_heads, 1)
+        .repeat(length, 2),
+        dtype=mx.int32,
+    )
+
+    def attend(values, mask, padding):
+        return msa.small_l_sparse_attention(
+            q, k, values, block_ids, mx.array(qpos), padding, block, dim**-0.5, mask
+        )
+
+    # Value rows 132 apart cannot take the 16-byte loads staging uses, so the
+    # kernel reads each value from device memory instead.
+    v_rows = mx.pad(v, [(0, 0), (0, 0), (0, 0), (0, 4)])[..., :dim]
+
+    kernel = msa._MSA_SMALL_L_PARTIALS
+    templates = []
+    monkeypatch.setattr(
+        msa,
+        "_MSA_SMALL_L_PARTIALS",
+        lambda **kw: templates.append(dict(kw["template"])) or kernel(**kw),
+    )
+    outs = [attend(v, keep, mx.array(pad)), attend(v, None, None)]
+    assert templates[0]["GT"] == 8 and templates[0]["STAGE_V"]
+
+    # Every grouping, chunk and value layout computes the same bits, including
+    # one threadgroup for all 16 heads reading values from device memory.
+    for heads_per_group, chunk in ((16, 32), (8, 32), (4, 32), (8, 64)):
+        monkeypatch.setattr(msa, "_SMALL_L_HEADS_PER_THREADGROUP", heads_per_group)
+        monkeypatch.setattr(msa, "_SMALL_L_VALUE_CHUNK", chunk)
+        for values in (v, v_rows):
+            assert mx.array_equal(attend(values, keep, mx.array(pad)), outs[0]).item()
+            assert mx.array_equal(attend(values, None, None), outs[1]).item()

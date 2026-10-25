@@ -416,6 +416,10 @@ def _patch_prompt_utils(prompt_utils: Any) -> None:
             **kwargs,
         ):
             if _is_minimax_model_type(model_name):
+                if isinstance(prompt, list):
+                    # The MiniMax template takes a string, so flatten ordered
+                    # text/image parts the way the formatter used to.
+                    prompt = prompt_utils.extract_text_from_content(prompt)
                 return _format_minimax_message(
                     prompt,
                     role,

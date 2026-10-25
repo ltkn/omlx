@@ -684,6 +684,7 @@ class HFUploader:
 
         task = self._tasks[task_id]
         tmp_readme: Optional[Path] = None
+        readme_backup: Optional[Path] = None
 
         try:
             async with self._upload_sem:
@@ -710,25 +711,33 @@ class HFUploader:
 
                 # Handle README
                 readme_in_model = model_path / "README.md"
+                readme_bytes: Optional[bytes] = None
                 if readme_source_path:
                     source_readme = Path(readme_source_path) / "README.md"
                     if source_readme.exists():
-                        shutil.copy2(source_readme, readme_in_model)
-                        tmp_readme = readme_in_model
+                        readme_bytes = source_readme.read_bytes()
                 elif auto_readme and not _has_meaningful_readme(model_path):
                     try:
                         with open(model_path / "config.json") as f:
                             config = json.load(f)
                     except Exception:
                         config = {}
-                    readme_content = _generate_model_card(
+                    readme_bytes = _generate_model_card(
                         task.model_name,
                         model_path,
                         config,
                         redownload_notice=redownload_notice,
-                    )
-                    readme_in_model.write_text(readme_content, encoding="utf-8")
+                    ).encode("utf-8")
+
+                if readme_bytes is not None:
+                    if readme_in_model.exists() or readme_in_model.is_symlink():
+                        # Keep the local card outside the uploaded folder.
+                        readme_backup = (
+                            Path(tempfile.mkdtemp(prefix="omlx-readme-")) / "README.md"
+                        )
+                        shutil.move(readme_in_model, readme_backup)
                     tmp_readme = readme_in_model
+                    readme_in_model.write_bytes(readme_bytes)
 
                 if task_id in self._cancelled:
                     return
@@ -769,10 +778,14 @@ class HFUploader:
                 task.error = str(e)
                 logger.error(f"Upload failed for {task.model_name}: {e}")
         finally:
-            # Clean up copied/generated README if we created it
-            if tmp_readme and tmp_readme.exists():
+            if tmp_readme is not None:
                 try:
-                    tmp_readme.unlink()
-                except Exception:
-                    pass
+                    tmp_readme.unlink(missing_ok=True)
+                    if readme_backup is not None:
+                        shutil.move(readme_backup, tmp_readme)
+                        readme_backup.parent.rmdir()
+                except OSError:
+                    logger.exception(
+                        f"Could not restore {tmp_readme} from {readme_backup}"
+                    )
             self._active_tasks.pop(task_id, None)

@@ -204,6 +204,12 @@ class TestUniversalQuantPredicate:
             is False
         )
 
+    def test_minimax_patch_merger_not_quantized(self, dense_config, module):
+        # MiniMax M3 projects merged image patches into the text space with
+        # patch_merge_mlp, after multi_modal_projector: part of the vision path.
+        for path in ("patch_merge_mlp.linear_1", "patch_merge_mlp.linear_2"):
+            assert universal_quant_predicate(path, module, dense_config) is False
+
     def test_ssm_alpha_not_quantized(self, dense_config, module):
         assert (
             universal_quant_predicate("model.layers.0.ssm_alpha", module, dense_config)
@@ -2338,6 +2344,68 @@ class TestEmbeddingGemma2Calibration:
             "language_model.norm.weight": mx.zeros((16,)),
         }
         assert set(sanitize(weights)) == set(weights)
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestDiffusionGemmaSanitizer:
+    _TEXT = {
+        "vocab_size": 32,
+        "hidden_size": 8,
+        "intermediate_size": 16,
+        "moe_intermediate_size": 4,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 4,
+        "global_head_dim": 4,
+        "num_experts": 2,
+        "top_k_experts": 1,
+    }
+
+    def test_streaming_plan_reads_the_encoder_vision_tower(self, tmp_path):
+        """DiffusionGemma's sanitize checks self.model.encoder.vision_tower."""
+        pytest.importorskip("mlx_vlm.models.diffusion_gemma")
+        config = {
+            "model_type": "diffusion_gemma",
+            "architectures": ["DiffusionGemmaForBlockDiffusion"],
+            "text_config": self._TEXT,
+            "vision_config": {"hidden_size": 8},
+        }
+        path = tmp_path / "model.safetensors"
+        _write_safetensors(
+            str(path),
+            {
+                "model.decoder.embed_tokens.weight": np.zeros((32, 8), np.float16),
+                "model.decoder.layers.0.experts.gate_up_proj": np.zeros(
+                    (2, 8, 8), np.float16
+                ),
+                "model.decoder.layers.0.experts.down_proj": np.zeros(
+                    (2, 8, 4), np.float16
+                ),
+                "model.encoder.language_model.layers.0.layer_scalar": np.ones(
+                    (1,), np.float16
+                ),
+                "model.encoder.vision_tower.encoder.layers.0.mlp.up_proj.linear.weight": np.zeros(
+                    (8, 8), np.float16
+                ),
+                "model.encoder.embed_vision.embedding_projection.weight": np.zeros(
+                    (8, 8), np.float16
+                ),
+            },
+        )
+
+        sanitize = _build_model_sanitizer(config, text_only=False)
+        plan = _discover_sanitize_plan(sanitize, _LazyTensorIndex([str(path)]))
+
+        assert plan is not None
+        assert set(plan) == {
+            "model.decoder.embed_tokens.weight",
+            "model.decoder.layers.0.experts.gate_up_proj.weight",
+            "model.decoder.layers.0.experts.down_proj.weight",
+            "model.encoder.language_model.layers.0.layer_scalar",
+            "model.encoder.vision_tower.encoder.layers.0.mlp.up_proj.linear.weight",
+            "model.encoder.embed_vision.embedding_projection.weight",
+        }
 
 
 class TestLazyTensorIndex:
@@ -7708,6 +7776,139 @@ class TestGlm5NextLayerWalk:
         finally:
             collector.restore(head)
         assert "language_model.mtp.0.block.self_attn.embed_q" in collector.entries
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestQwen35TextCheckpoint:
+    @pytest.fixture(
+        params=[
+            pytest.param(("qwen3_5_text", False), id="dense-text"),
+            pytest.param(("qwen3_5_moe_text", False), id="moe-text"),
+            pytest.param(("qwen3_5", False), id="existing-name"),
+            pytest.param(("qwen3_5_text", True), id="dense-text-mtp"),
+        ]
+    )
+    def checkpoint(self, tmp_path, request):
+        from mlx.utils import tree_flatten
+        from mlx_lm.models import qwen3_5, qwen3_5_moe
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from transformers import PreTrainedTokenizerFast
+
+        from omlx.patches.mlx_lm_mtp import (
+            apply_mlx_lm_mtp_patch,
+            is_mtp_active,
+            set_mtp_active,
+        )
+
+        model_type, with_mtp = request.param
+        config = {
+            "model_type": model_type,
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 16,
+            "linear_num_value_heads": 4,
+            "linear_num_key_heads": 2,
+            "linear_key_head_dim": 16,
+            "linear_value_head_dim": 16,
+            "vocab_size": 64,
+            "full_attention_interval": 2,
+            "max_position_embeddings": 512,
+            "mtp_num_hidden_layers": int(with_mtp),
+            "tie_word_embeddings": False,
+        }
+        if "moe" in model_type:
+            config.update(
+                num_experts=4,
+                num_experts_per_tok=2,
+                shared_expert_intermediate_size=128,
+                moe_intermediate_size=128,
+            )
+            module = qwen3_5_moe
+        else:
+            module = qwen3_5
+        mx.random.seed(7)
+        apply_mlx_lm_mtp_patch()
+        was_active = is_mtp_active()
+        try:
+            set_mtp_active(with_mtp)
+            model = module.Model(module.ModelArgs.from_dict(config))
+        finally:
+            set_mtp_active(was_active)
+        model.set_dtype(mx.bfloat16)
+        source = tmp_path / "source"
+        source.mkdir()
+        weights = {
+            name.removeprefix("language_model."): value
+            for name, value in tree_flatten(model.parameters())
+        }
+        mx.save_safetensors(str(source / "model.safetensors"), weights)
+        (source / "config.json").write_text(json.dumps(config))
+        vocab = {f"t{i}": i for i in range(config["vocab_size"])}
+        tokenizer = Tokenizer(WordLevel(vocab, unk_token="t0"))
+        PreTrainedTokenizerFast(
+            tokenizer_object=tokenizer, unk_token="t0"
+        ).save_pretrained(source)
+        return source, model, config
+
+    def test_source_load_matches_the_supported_model(self, checkpoint):
+        from omlx.utils.model_loading import (
+            lm_load_compat,
+            maybe_apply_pre_load_patches,
+        )
+
+        source, expected, config = checkpoint
+        maybe_apply_pre_load_patches(str(source))
+        loaded, _ = lm_load_compat(str(source))
+        tokens = mx.array([[1, 2, 3]])
+
+        assert mx.array_equal(loaded(tokens), expected(tokens)).item()
+        assert json.loads((source / "config.json").read_text()) == config
+
+    def test_oqe_collects_imatrix_and_output_reloads(
+        self, checkpoint, tmp_path, monkeypatch
+    ):
+        from mlx_lm.utils import load_model
+
+        from omlx import oq
+
+        source, _, config = checkpoint
+        tokens = (mx.arange(128).reshape(8, 16) % 63 + 1).astype(mx.int32)
+        monkeypatch.setattr(
+            oq, "_load_calibration_data", lambda *args, **kwargs: tokens
+        )
+        output = tmp_path / "oqe"
+        quantize_oq_streaming(
+            str(source),
+            str(output),
+            4,
+            enhanced=True,
+            imatrix_num_samples=4,
+            imatrix_seq_length=16,
+            sensitivity_map_override={0: 0.1, 1: 0.2},
+        )
+
+        report = json.loads((output / "oq_imatrix_report.json").read_text())
+        assert report["applied"]
+        assert report["missing"] == ["language_model.lm_head"]
+        assert not report["mismatched"]
+        output_config = json.loads((output / "config.json").read_text())
+        assert output_config["model_type"] == config["model_type"].removesuffix("_text")
+        loaded, _ = load_model(output, strict=True)
+        assert mx.isfinite(loaded(tokens[:1])).all().item()
+
+    def test_proxy_output_reloads(self, checkpoint, tmp_path):
+        from mlx_lm.utils import load_model
+
+        source, _, _ = checkpoint
+        output = tmp_path / "proxy"
+        _build_streaming_proxy_for_sensitivity(str(source), output, dtype="bfloat16")
+
+        loaded, _ = load_model(output, strict=True)
+        assert mx.isfinite(loaded(mx.array([[1, 2, 3]]))).all().item()
 
 
 def _flint_config(window=513):
