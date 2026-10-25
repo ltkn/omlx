@@ -57,7 +57,7 @@ The first oQe run of a model collects the imatrix and saves it in `.oqe_imatrix`
 
 ### What gets protected
 
-- **Output head and embeddings:** 8-bit when the size budget allows.
+- **Output head and embeddings:** the head gets three bits over the base width, capped at 8; embeddings get one bit over the base for tied or large tables, otherwise 8-bit. The legacy allocation pins both at 8-bit.
 - **MoE routers:** kept at full precision. Shared-expert gates are 8-bit.
 - **Vision and audio encoders:** not quantized.
 - **Norms and recurrent state parameters** (SSM and linear attention): not quantized.
@@ -66,6 +66,10 @@ The first oQe run of a model collects the imatrix and saves it in `.oqe_imatrix`
 - **MTP heads** (with **Preserve MTP weights**): kept, with the small connecting layers at full precision and the rest at 4-bit or more.
 
 Every model ends up with its own bit layout, because the plan follows that model's measurements.
+
+### Allocation compatibility
+
+The default plan follows upstream #4776: the output head tracks the base width, embeddings are sized by table share, dense models below 3-bit get a 3-bit floor, and MoE always-on tensors climb together. Pass `legacy_allocation=True` to `quantize_oq_streaming` (and `estimate_bpw_and_size`) to restore the pre-#4776 layout: `lm_head` and the token embeddings are fixed at 8-bit and both always-on rules are skipped. The custom-corpus build scripts use it by default through `OQ_LEGACY_ALLOCATION=1`; upstream remains the default for everything else.
 
 ### Calibration data
 

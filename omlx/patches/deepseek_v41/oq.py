@@ -390,6 +390,7 @@ def quantize(
     ngram_bits=None,
     stream_calibration=None,
     preserve_ngram_table=False,
+    legacy_allocation=False,
 ):
     from ...oq import (
         _OQ_BPW_TARGETS,
@@ -470,6 +471,7 @@ def quantize(
             sensitivity_calib_dataset=sensitivity_calib_dataset,
             progress_callback=progress_callback,
             stream_calibration=stream_calibration,
+            legacy_allocation=legacy_allocation,
         )
         budget["remaining_weights"].update(
             {key: preparation[key] for key in ("tensor_bytes", "effective_bpw")}
@@ -699,6 +701,7 @@ def prepare_affine_conversion(
     sensitivity_calib_dataset=None,
     progress_callback,
     stream_calibration=None,
+    legacy_allocation=False,
 ):
     from ...oq import (
         _OQE_CALIB_DATASET,
@@ -845,6 +848,7 @@ def prepare_affine_conversion(
         oq_level=oq_level,
         target=target,
         cap=cap,
+        legacy_allocation=legacy_allocation,
     )
     report.update(
         imatrix_cache_path=imatrix.path,

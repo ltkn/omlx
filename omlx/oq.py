@@ -1284,6 +1284,7 @@ def _build_quant_plan(
     fixed_overrides: dict[str, dict] | None = None,
     supported_bits: tuple[int, ...] = _VALID_QUANT_BITS,
     always_on_rules: bool = True,
+    legacy_allocation: bool = False,
 ) -> QuantPlan:
     """Allocate byte-budgeted boosts using sensitivity-driven allocation.
 
@@ -1302,11 +1303,18 @@ def _build_quant_plan(
     always_on_rules=False skips steps 2 and 3 for callers with their own
     allocation or exporter constraints.
 
+    legacy_allocation=True restores the pre-#4776 allocation used by the
+    custom-corpus exports: lm_head/embeddings are pinned at 8-bit and the
+    dense/MoE always-on rules are skipped. The default keeps upstream's
+    base-width head sizing.
+
     fixed_overrides marks tensors whose output format is fixed up front
     (pre-quantized source tensors passed through as mxfp4/mxfp8). They are
     priced into the baseline bpw at their true cost and excluded from every
     boost decision.
     """
+    if legacy_allocation:
+        always_on_rules = False
     base_bits = _base_bits_for_level(oq_level)
     if base_bits not in supported_bits:
         raise ValueError("Base quantization width is not supported by this model")
@@ -1365,16 +1373,26 @@ def _build_quant_plan(
             continue
         for pattern in _MANDATORY_BOOST_PATTERNS:
             if pattern in path:
-                numel = 1
-                for dim in shape:
-                    numel *= dim
-                cand_bits = _mandatory_head_bits(
-                    pattern, numel, total_params, base_bits, tied_embeddings, is_moe
-                )
+                if legacy_allocation:
+                    cand_bits = 8
+                    cand_gs = _OQ_DEFAULT_GROUP_SIZE
+                    cand_mode = "affine"
+                else:
+                    numel = 1
+                    for dim in shape:
+                        numel *= dim
+                    cand_bits = _mandatory_head_bits(
+                        pattern,
+                        numel,
+                        total_params,
+                        base_bits,
+                        tied_embeddings,
+                        is_moe,
+                    )
+                    cand_gs = _gs_for_mode(cand_bits, _OQ_DEFAULT_GROUP_SIZE)
+                    cand_mode = _mode_for_bits(cand_bits)
                 if cand_bits <= base_bits:
                     break
-                cand_gs = _gs_for_mode(cand_bits, _OQ_DEFAULT_GROUP_SIZE)
-                cand_mode = _mode_for_bits(cand_bits)
                 base_cost = _tensor_quantized_bytes(
                     shape, base_bits, base_group_size, base_mode
                 )
@@ -3765,6 +3783,7 @@ def estimate_bpw_and_size(
     preserve_mtp: bool = False,
     ngram_bits: int | None = None,
     preserve_ngram_table: bool = False,
+    legacy_allocation: bool = False,
 ) -> dict:
     """Calculate precise effective bpw and output size by scanning actual tensors.
 
@@ -3782,6 +3801,9 @@ def estimate_bpw_and_size(
         group_size: Quantization group size.
         ngram_bits: Optional N-gram/Engram table override, mirroring the
             matching argument in ``quantize_oq_streaming``.
+        legacy_allocation: Price the pre-#4776 allocation (fixed 8-bit
+            head/embeddings), mirroring the matching argument in
+            ``quantize_oq_streaming``.
 
     Returns:
         Dict with effective_bpw, output_size_bytes, output_size_formatted.
@@ -3976,6 +3998,7 @@ def estimate_bpw_and_size(
             target_bpw=_level_targets[0],
             hard_cap_bpw=_level_targets[1],
             fixed_overrides=fixed_overrides,
+            legacy_allocation=legacy_allocation,
         )
         config["_oq_boost_map"] = plan.boost_map
     else:
@@ -6725,6 +6748,7 @@ def quantize_oq_streaming(
     calib_dataset: str | None = None,
     sensitivity_calib_dataset: str | None = None,
     ngram_bits: int | None = None,
+    legacy_allocation: bool = False,
 ) -> None:
     """Tensor-by-tensor quantization. Memory: ~3-4GB regardless of model size.
 
@@ -6818,6 +6842,11 @@ def quantize_oq_streaming(
             at least 4 bits, e.g. Q8 at oQ4e). Pass 8 to keep the table at
             Q8 group-32 affine while the rest of the model follows the oQ
             level. Cannot be combined with preserve_ngram_table.
+        legacy_allocation: Restore the pre-#4776 allocation: lm_head and
+            token embeddings are pinned at Q8 and the dense/MoE always-on
+            rules are skipped. Defaults to False (upstream's base-width
+            head sizing). Used by the custom-corpus builds to stay
+            comparable with their accepted baselines.
     """
     if oq_level not in OQ_LEVELS:
         raise ValueError(
@@ -6897,6 +6926,7 @@ def quantize_oq_streaming(
             stream_calibration=stream_calibration,
             progress_callback=progress_callback,
             preserve_ngram_table=preserve_ngram_table,
+            legacy_allocation=legacy_allocation,
         )
     if (
         normalized_model_type in MLX_LM_TEXT_ONLY_MODEL_TYPES
@@ -7435,6 +7465,7 @@ def quantize_oq_streaming(
             target_bpw=_t,
             hard_cap_bpw=_c,
             fixed_overrides=fixed_overrides,
+            legacy_allocation=legacy_allocation,
         )
         config["_oq_boost_map"] = plan.boost_map
         logger.info(
