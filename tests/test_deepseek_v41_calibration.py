@@ -351,6 +351,43 @@ def test_affine_plan_preserves_vision_precision(
         )
 
 
+def test_affine_plan_forwards_legacy_allocation(monkeypatch):
+    from types import SimpleNamespace
+
+    from omlx import oq
+    from omlx.patches.deepseek_v41.oq_inventory import build_affine_plan
+
+    expert = "language_model.layers.0.ffn.experts.w1"
+    inventory = {expert: dict(shape=(128, 64, 64), source_bytes=278528)}
+    imatrix = SimpleNamespace(entries={expert: SimpleNamespace(counts=np.ones(128))})
+    budget = dict(
+        remaining_weights=dict(logical_parameters=524288, tensor_bytes=278528)
+    )
+    seen = {}
+    real = oq._build_quant_plan
+
+    def spy(*args, **kwargs):
+        seen.update(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(oq, "_build_quant_plan", spy)
+    build_affine_plan(
+        inventory,
+        budget,
+        {"model_type": "deepseek_v41"},
+        imatrix,
+        {"0": 0.5},
+        oq_level=3,
+        target=3.5,
+        cap=3.7,
+        legacy_allocation=True,
+    )
+    # V4.1 keeps its own exporter constraints but opts into the fixed Q8
+    # mandatory patterns through the shared allocator.
+    assert seen["legacy_allocation"] is True
+    assert seen["always_on_rules"] is False
+
+
 @pytest.mark.parametrize(
     "model_type,collection,missing",
     [

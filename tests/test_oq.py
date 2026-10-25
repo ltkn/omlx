@@ -1642,6 +1642,33 @@ class TestLevelBudgetPlan:
         assert "lm_head" in plan.boost_map
         assert plan.boost_map["lm_head"]["bits"] == 6
 
+    def test_legacy_allocation_pins_head_and_embeddings_at_q8(self):
+        # Pre-#4776 exports keep the mandatory head/embedding patterns at Q8
+        # even when the base width would size the head lower (6 at oQ4).
+        named_shapes = {
+            "lm_head": (4096, 32000),
+            "model.embed_tokens": (32000, 4096),
+        }
+        for i in range(32):
+            named_shapes[f"model.layers.{i}.self_attn.v_proj"] = (4096, 4096)
+            named_shapes[f"model.layers.{i}.self_attn.q_proj"] = (4096, 4096)
+            named_shapes[f"model.layers.{i}.mlp.gate_proj"] = (14336, 4096)
+            named_shapes[f"model.layers.{i}.mlp.up_proj"] = (14336, 4096)
+            named_shapes[f"model.layers.{i}.mlp.down_proj"] = (4096, 14336)
+        config = {"num_hidden_layers": 32, "_oq_use_budget_plan": True}
+        plan = _build_quant_plan(
+            named_shapes,
+            config,
+            4,
+            target_bpw=4.6,
+            hard_cap_bpw=4.7,
+            legacy_allocation=True,
+        )
+        expected = {"bits": 8, "group_size": 64, "mode": "affine"}
+        assert plan.boost_map["lm_head"] == expected
+        assert plan.boost_map["model.embed_tokens"] == expected
+        assert plan.effective_bpw <= 4.7
+
     def test_mandatory_head_bits_track_the_base_width(self):
         head = [
             _mandatory_head_bits("lm_head", 1, 100, b, False, False)
