@@ -23,12 +23,14 @@ from ..base import (
 )
 from ..cache import KVCache
 from .config import ModelConfig, TextConfig
+from . import decode_kernels
 from .moe_rows import scaled_switch_glu
 from .msa import (
     build_grouped_msa_topk,
     msa_prefill_supported,
     msa_sparse_attention_b1,
     small_l_block_scores,
+    small_l_select_blocks,
     small_l_sparse_attention,
 )
 from .qmv_rows import mxfp8_rows_matmul, row_exact_linears, rows_linear
@@ -158,6 +160,9 @@ def _sparse_block_selection(
             local_blocks,
         )
         if negated is not None:
+            selected = small_l_select_blocks(negated, k)
+            if selected is not None:
+                return selected
             return mx.argpartition(negated, kth=k - 1, axis=-1)[..., :k].astype(
                 mx.int32
             )
@@ -389,14 +394,30 @@ class MiniMaxRMSNorm(nn.Module):
         self.weight = mx.zeros((dims,)) if gemma else mx.ones((dims,))
         self.eps = eps
         self.gemma = gemma
+        # Plain attribute, not a parameter: (weight the scale was built from, scale).
+        self._cached_scale = None
+
+    def _scale(self) -> mx.array:
+        # Form 1 + w in float32: adding 1 to a bf16 weight rounds every channel.
+        # Built once per weight array; a reloaded weight is a new array.
+        weight = self.weight
+        cached = self._cached_scale
+        if cached is None or cached[0] is not weight:
+            scale = weight.astype(mx.float32)
+            if self.gemma:
+                scale = scale + 1
+            cached = (weight, scale)
+            object.__setattr__(self, "_cached_scale", cached)
+        return cached[1]
 
     def __call__(self, x, dtype=None):
-        # Form 1 + w in float32: adding 1 to a bf16 weight rounds every channel.
-        weight = self.weight.astype(mx.float32)
-        if self.gemma:
-            weight = weight + 1
+        weight = self._scale()
+        dtype = x.dtype if dtype is None else dtype
+        output = decode_kernels.rms_norm(x, weight, self.eps, dtype)
+        if output is not None:
+            return output
         output = mx.fast.rms_norm(x, weight, self.eps)
-        return output.astype(x.dtype if dtype is None else dtype)
+        return output.astype(dtype)
 
 
 class MiniMaxM3KVCache:
@@ -1198,6 +1219,47 @@ class MiniMaxAttention(nn.Module):
         names = _INPUT_PROJECTIONS if self.has_sparse_index else _INPUT_PROJECTIONS[:3]
         return _project(self, names, x)
 
+    def _fused_head_norm_rope(
+        self, queries, keys, projected, rope_offset, use_sparse_mask
+    ):
+        """The head norms and RoPE below for a call of up to eight rows in one
+        launch: the rotated queries, keys, index queries and index keys, or
+        None when the call is not covered."""
+        B, L = queries.shape[:2]
+        rope = self.rope
+        if (
+            B * L > decode_kernels.MAX_ROWS
+            or not self.use_qk_norm
+            or type(rope) is not nn.RoPE
+            or rope.traditional
+        ):
+            return None
+        xs = [queries, keys]
+        norms = [self.q_norm, self.k_norm]
+        if use_sparse_mask:
+            index_q = projected["index_q_proj"]
+            index_k = projected["index_k_proj"]
+            xs += [
+                index_q.reshape(B, L, self.index_heads, self.index_dim),
+                index_k.reshape(B, L, 1, self.index_dim),
+            ]
+            norms += [self.index_q_norm, self.index_k_norm]
+        eps = norms[0].eps
+        if any(norm.eps != eps for norm in norms):
+            return None
+        rotated = decode_kernels.head_norm_rope(
+            xs,
+            [norm._scale() for norm in norms],
+            eps,
+            rope_offset,
+            rope.dims,
+            rope.base,
+            rope.scale,
+        )
+        if rotated is not None and not use_sparse_mask:
+            rotated += [None, None]
+        return rotated
+
     def __call__(
         self,
         x: mx.array,
@@ -1227,34 +1289,43 @@ class MiniMaxAttention(nn.Module):
         keys = keys.reshape(B, L, self.num_key_value_heads, self.head_dim)
         values = values.reshape(B, L, self.num_key_value_heads, self.head_dim)
 
-        # q/k norms and RoPE run in float32 and round to the model dtype once.
-        if self.use_qk_norm:
-            queries = self.q_norm(queries, dtype=mx.float32)
-            keys = self.k_norm(keys, dtype=mx.float32)
-
-        if use_sparse_mask:
-            idx_queries = projected["index_q_proj"]
-            idx_keys = projected["index_k_proj"]
-            idx_queries = idx_queries.reshape(B, L, self.index_heads, self.index_dim)
-            idx_keys = idx_keys.reshape(B, L, 1, self.index_dim)
-            idx_queries = self.index_q_norm(idx_queries, dtype=mx.float32)
-            idx_keys = self.index_k_norm(idx_keys, dtype=mx.float32)
-            idx_queries = self.rope(
-                idx_queries.transpose(0, 2, 1, 3), offset=rope_offset
-            ).astype(x.dtype)
-            idx_keys = self.rope(
-                idx_keys.transpose(0, 2, 1, 3), offset=rope_offset
-            ).astype(x.dtype)
+        fused = self._fused_head_norm_rope(
+            queries, keys, projected, rope_offset, use_sparse_mask
+        )
+        if fused is not None:
+            queries, keys, idx_queries, idx_keys = fused
+            values = values.transpose(0, 2, 1, 3)
         else:
-            idx_queries = None
-            idx_keys = None
+            # q/k norms and RoPE run in float32 and round to the model dtype once.
+            if self.use_qk_norm:
+                queries = self.q_norm(queries, dtype=mx.float32)
+                keys = self.k_norm(keys, dtype=mx.float32)
 
-        queries = queries.transpose(0, 2, 1, 3)
-        keys = keys.transpose(0, 2, 1, 3)
-        values = values.transpose(0, 2, 1, 3)
+            if use_sparse_mask:
+                idx_queries = projected["index_q_proj"]
+                idx_keys = projected["index_k_proj"]
+                idx_queries = idx_queries.reshape(
+                    B, L, self.index_heads, self.index_dim
+                )
+                idx_keys = idx_keys.reshape(B, L, 1, self.index_dim)
+                idx_queries = self.index_q_norm(idx_queries, dtype=mx.float32)
+                idx_keys = self.index_k_norm(idx_keys, dtype=mx.float32)
+                idx_queries = self.rope(
+                    idx_queries.transpose(0, 2, 1, 3), offset=rope_offset
+                ).astype(x.dtype)
+                idx_keys = self.rope(
+                    idx_keys.transpose(0, 2, 1, 3), offset=rope_offset
+                ).astype(x.dtype)
+            else:
+                idx_queries = None
+                idx_keys = None
 
-        queries = self.rope(queries, offset=rope_offset).astype(x.dtype)
-        keys = self.rope(keys, offset=rope_offset).astype(x.dtype)
+            queries = queries.transpose(0, 2, 1, 3)
+            keys = keys.transpose(0, 2, 1, 3)
+            values = values.transpose(0, 2, 1, 3)
+
+            queries = self.rope(queries, offset=rope_offset).astype(x.dtype)
+            keys = self.rope(keys, offset=rope_offset).astype(x.dtype)
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
 
@@ -1449,9 +1520,57 @@ class MiniMaxSparseMoeBlock(nn.Module):
         )
         self.sharding_group = None
 
+    def _fused_short_call(self, x: mx.array) -> Optional[mx.array]:
+        """The block for up to eight rows with fused routing, and for one row
+        with fused experts, or None when not covered.
+
+        Every row's router logits are MLX's one-row matrix-vector product, as
+        ``_router_gates`` computes them for one row and in a row-exact verify,
+        so a batched decode row routes like the same request alone. The expert
+        selection runs in one launch, and one row's routed and shared experts
+        in two.
+        """
+        gate = self.gate
+        if (
+            self.sharding_group is not None
+            or self.pack_shared_expert
+            or self.scoring_func != "sigmoid"
+            or self.e_score_correction_bias is None
+            or type(gate) is not nn.Linear
+            or "bias" in gate
+            or x.size > decode_kernels.MAX_ROWS * x.shape[-1]
+        ):
+            return None
+        logits = decode_kernels.moe_router_logits(x, gate.weight)
+        if logits is None:
+            logits = _router_gates(gate, x)
+        routed = decode_kernels.moe_router_select(
+            logits,
+            self.e_score_correction_bias,
+            self.num_experts_per_tok,
+            self.routed_scaling_factor,
+            self.switch_mlp.down_scale if self.routed_expert_scales else None,
+        )
+        if routed is None:
+            return None
+        inds, scores = routed
+        y = decode_kernels.moe_experts(
+            x, inds, scores, self.switch_mlp, self.shared_experts
+        )
+        if y is not None:
+            return y
+        y = _combine_routed(self.switch_mlp(x, inds), scores)
+        if self.shared_experts is not None:
+            y = y + self.shared_experts(x)
+        return y
+
     def __call__(self, x: mx.array) -> mx.array:
         if self.sharding_group is not None:
             x = sum_gradients(self.sharding_group)(x)
+
+        y = self._fused_short_call(x)
+        if y is not None:
+            return y
 
         gates = _router_gates(self.gate, x)
         bias = self.e_score_correction_bias

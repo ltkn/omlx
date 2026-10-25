@@ -139,7 +139,7 @@ cluster = [
     "zeroconf>=0.131.0",
 ]
 modelscope = [
-    "modelscope>=1.10.0",
+    "modelscope>=1.28.0",
 ]
 audio = [
     # mlx-audio from commit (94c7716, v0.5.7) with tts/stt/sts extras
@@ -174,7 +174,7 @@ paroquant = [
 # separately with --no-deps after the shared layer resolves.
 bundle = [
     "mcp>=2.0.0,<3",
-    "modelscope>=1.10.0",
+    "modelscope>=1.28.0",
     # mlx-audio[tts,stt,sts] transitives:
     "scipy>=1.11.0",
     "librosa>=0.10.0",

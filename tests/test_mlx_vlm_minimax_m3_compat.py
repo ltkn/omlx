@@ -119,6 +119,14 @@ def test_minimax_prompt_utils_restore_image_placeholders():
         "content": "]<]image[>[" * 2 + "describe",
     }
 
+    # The generic VLM formatter can pass ordered parts instead of a string.
+    message = get_message_json(
+        "minimax_m3_vl",
+        [{"type": "text", "text": "Describe this."}, {"type": "image"}],
+        num_images=1,
+    )
+    assert message == {"role": "user", "content": "]<]image[>[Describe this."}
+
     rendered_messages = apply_chat_template(
         processor=None,
         config={"model_type": "minimax_m3_vl"},

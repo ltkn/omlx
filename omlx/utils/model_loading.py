@@ -15,6 +15,7 @@ from mlx.utils import tree_flatten
 from ..patches.arrays_cache_metadata import apply_arrays_cache_metadata_patch
 from ..patches.mlx_vlm_minimax_m3_compat import adopt_expert_global_scales
 from ..patches.qwen35_yarn import apply_qwen35_yarn_patch, set_context_window
+from ..patches.raon1_mini import normalize_raon1_mini_model_file
 
 logger = logging.getLogger(__name__)
 
@@ -312,6 +313,14 @@ def expand_glm_moe_dsa_fused_quant_keys(cfg: dict) -> dict:
     return cfg
 
 
+def normalize_qwen35_text_config(cfg: dict) -> dict:
+    """Use mlx-lm's Qwen3.5 names for text-only Hugging Face checkpoints."""
+    model_type = cfg.get("model_type")
+    if model_type in ("qwen3_5_text", "qwen3_5_moe_text"):
+        cfg["model_type"] = model_type.removesuffix("_text")
+    return cfg
+
+
 def normalize_hy_v3_rope_config(cfg: dict) -> dict:
     """Adapt legacy Hy-MT2 RoPE settings to mlx-lm's ``hy_v3`` schema.
 
@@ -445,6 +454,7 @@ def _patch_mlx_lm_load_config() -> None:
 
     def _patched(model_path, *args, **kwargs):
         cfg = _original(model_path, *args, **kwargs)
+        normalize_qwen35_text_config(cfg)
         normalize_hy_v3_rope_config(cfg)
         # Cluster ranks load MiniMax through mlx-lm, not the patched mlx-vlm.
         adopt_expert_global_scales(cfg)
@@ -453,6 +463,7 @@ def _patch_mlx_lm_load_config() -> None:
         normalize_laguna_compressed_quant(cfg)
         normalize_bailing_hybrid_fp8_quant(cfg)
         normalize_mimo_mxfp4_quant(cfg)
+        normalize_raon1_mini_model_file(cfg)
         return cfg
 
     _lu.load_config = _patched
@@ -518,6 +529,10 @@ def maybe_apply_pre_load_patches(
     - Ling 3.0 Flash mixed MLA/KDA model when ``config.json`` declares
       ``model_type == "bailing_hybrid"``. The vendored module is registered
       as ``mlx_lm.models.bailing_hybrid`` before mlx-lm resolves its classes.
+    - Raon-1 mini RDA/MLA hybrid when ``config.json`` declares
+      ``model_type == "raon1_mini"``. The checkpoint's ``model_file`` is
+      served by the vendored ``mlx_lm.models.raon1_mini`` instead of being
+      imported.
     - Llama 4 attention offset patch when ``config.json`` declares
       ``model_type == "llama4"`` directly or under ``text_config``.
     - GLM-5.2 ``glm_moe_dsa`` patch (mlx-lm PR 1410) when ``config.json``
@@ -628,6 +643,8 @@ def maybe_apply_pre_load_patches(
         )
         return
 
+    normalize_qwen35_text_config(config)
+
     # Bonsai t5 load patch must run FIRST — before any other patch that wraps
     # load_weights on a model subclass (e.g. mlx_vlm_mtp qwen35_vlm_runtime).
     # Those patches capture cls.load_weights as original_load_weights; if our
@@ -728,6 +745,12 @@ def maybe_apply_pre_load_patches(
 
         if apply_bailing_hybrid_patch():
             logger.info("Ling 3.0 Flash pre-load patch applied for %s", model_name)
+
+    if model_type == "raon1_mini":
+        from ..patches.raon1_mini import apply_raon1_mini_patch
+
+        if apply_raon1_mini_patch():
+            logger.info("Raon-1 mini pre-load patch applied for %s", model_name)
 
     if model_type == "laguna":
         # MLX-LM dynamically imports the architecture and tokenizer-configured
@@ -1343,6 +1366,7 @@ _DFLASH_BATCHED_MODEL_TYPES = {
     "vlm": (
         "qwen3_5",
         "qwen3_5_moe",
+        "minicpmv4_7",
         "glm5_next",
         "gemma4",
         "gemma4_unified",
@@ -1372,8 +1396,9 @@ def dflash_compatibility(
     if dflash_batched_supported(model_type, engine_type):
         return True, ""
     return False, (
-        "DFlash supports Qwen3, Qwen3.5/3.6, Laguna, MiMo V2, GLM-5.3, Gemma 4 and "
-        f"Muse Glimmer models (model_type='{model_type or ''}', "
+        "DFlash supports Qwen3, Qwen3.5/3.6, Laguna, MiMo V2, GLM-5.3, Gemma 4, "
+        "Muse Glimmer and MiniCPM-V 4.7 models "
+        f"(model_type='{model_type or ''}', "
         f"engine='{engine_type}')"
     )
 

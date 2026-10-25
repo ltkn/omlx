@@ -5,10 +5,10 @@ a one-row decode step, and from three rows on they stream the weights again
 for every row. ``exact_rows_qmv`` keeps MLX ``fp_qmv_fast``'s per-row
 arithmetic and 32-lane reduction order but reads each weight once for all
 rows, so speculative verify rows and small decode batches match one-row decode
-bit for bit. Two-row calls stay on MLX, which reads the weights once for them
-and is slightly faster there, except inside a row-exact verify forward. A
-row-exact verify also runs the base checkpoint's BF16 vocabulary head through
-``exact_verify_gemv``, MLX's one-row GEMV with every row sharing a weight load.
+bit for bit. One-row MXFP8 calls run ``decode_kernels.mxfp8_one_row``, the
+same arithmetic with more weight loads in flight. The base checkpoint's BF16
+vocabulary head runs through ``exact_verify_gemv`` for the same reason as the
+rows: MLX's one-row GEMV with every row sharing a weight load.
 """
 
 from __future__ import annotations
@@ -17,6 +17,8 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from omlx.patches import row_exact_qmv
+
+from . import decode_kernels
 from omlx.patches.deepseek_v4.verify_qmv import (
     dense_eligible,
     exact_rows_qmv,
@@ -24,7 +26,6 @@ from omlx.patches.deepseek_v4.verify_qmv import (
 )
 from omlx.patches.qwen35_verify_qmm import is_row_exact_armed
 
-MIN_ROWS = 3
 MAX_ROWS = 8
 # Up to this many rows keep their inputs in registers. Longer calls read them
 # from cache inside the row loop, which avoids register spills.
@@ -39,16 +40,13 @@ _WIDE_OUTPUT_COLUMNS = 65536
 def mxfp8_rows_matmul(
     x: mx.array, weight: mx.array, scales: mx.array, quant: dict
 ) -> mx.array | None:
-    """``x @ dequantized(weight).T`` for 3-8 rows, or None when not covered.
-
-    A row-exact verify forward takes two-row calls here too.
-    """
+    """``x @ dequantized(weight).T`` for 1-8 rows, every row with one-row
+    decode arithmetic, or None when not covered."""
     k = x.shape[-1]
     rows = x.size // k
     n = weight.shape[0]
-    min_rows = 2 if is_row_exact_armed() else MIN_ROWS
     if not (
-        min_rows <= rows <= MAX_ROWS
+        1 <= rows <= MAX_ROWS
         and quant.get("mode") == "mxfp8"
         and quant.get("bits") == 8
         and quant.get("group_size") == 32
@@ -61,6 +59,8 @@ def mxfp8_rows_matmul(
         and mx.metal.is_available()
     ):
         return None
+    if rows == 1:
+        return decode_kernels.mxfp8_one_row(x, weight, scales)
     held = rows <= _HELD_INPUT_MAX_ROWS
     y = exact_rows_qmv(
         x.reshape(rows, k),
@@ -89,15 +89,21 @@ def _row_exact_tile(rows: int, columns: int) -> tuple[int, int]:
 
 
 def row_exact_linears(linears, x: mx.array) -> tuple | None:
-    """Affine projections of ``x`` in a row-exact verify forward, or None.
+    """Affine projections of ``x`` in a row-exact verify forward (and the
+    vocabulary head of a decode batch), or None.
 
     One launch whose threadgroups apply each weight block to several rows, so
     the weights are read once per row group instead of once per row.
     """
     rows = x.size // x.shape[-1]
-    if not (2 <= rows <= MAX_ROWS and is_row_exact_armed()):
-        return None
     columns = sum(int(linear.weight.shape[0]) for linear in linears)
+    # A decode batch runs the vocabulary head here too, so its rows match the
+    # requests decoded alone.
+    if not (
+        2 <= rows <= MAX_ROWS
+        and (is_row_exact_armed() or columns >= _WIDE_OUTPUT_COLUMNS)
+    ):
+        return None
     padded, per_group = _row_exact_tile(rows, columns)
     flat = x.reshape(rows, x.shape[-1])
     if padded > rows:
@@ -123,10 +129,6 @@ def rows_linear(proj, x: mx.array) -> mx.array:
         out = row_exact_linears((proj,), x)
         if out is not None:
             return out[0]
-    elif (
-        type(proj) is nn.Linear
-        and is_row_exact_armed()
-        and dense_eligible(proj, x, max_rows=MAX_ROWS)
-    ):
+    elif type(proj) is nn.Linear and dense_eligible(proj, x, max_rows=MAX_ROWS):
         return exact_verify_gemv(proj, x)
     return proj(x)

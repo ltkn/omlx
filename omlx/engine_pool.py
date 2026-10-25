@@ -3857,6 +3857,42 @@ class EnginePool:
         self._failed_load_reclaim_tasks.add(task)
         task.add_done_callback(self._finish_failed_load_reclaim_task)
 
+    @staticmethod
+    async def _start_engine(engine) -> None:
+        """Drain startup before stopping an engine whose acquisition was cancelled."""
+        if isinstance(engine, SplashEngine):
+            # Splash stops its subprocess when readiness is cancelled; do not
+            # defer that cleanup until its startup timeout expires.
+            await engine.start()
+            return
+        task = asyncio.create_task(engine.start())
+        cancelled = False
+        try:
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    cancelled = True
+        finally:
+            if cancelled:
+                # start() can own a running core while awaiting a loader thread.
+                # Keep that thread alive until startup settles, then stop the
+                # unregistered engine before _load_engine clears is_loading.
+                with suppress(Exception, asyncio.CancelledError):
+                    task.result()
+                stop_task = asyncio.create_task(engine.stop())
+                try:
+                    while not stop_task.done():
+                        with suppress(asyncio.CancelledError):
+                            await asyncio.shield(stop_task)
+                    stop_task.result()
+                except Exception:
+                    logger.warning(
+                        "Error stopping engine after cancelled startup", exc_info=True
+                    )
+                raise asyncio.CancelledError
+        task.result()
+
     async def _load_engine(
         self,
         model_id: str,
@@ -4089,7 +4125,7 @@ class EnginePool:
             if isinstance(engine, SplashEngine):
                 self._starting_external[model_id] = engine
             try:
-                await engine.start()
+                await self._start_engine(engine)
             except Exception as start_error:
                 if isinstance(engine, SplashEngine):
                     # start() already stopped Splash; its error carries the
@@ -4122,7 +4158,7 @@ class EnginePool:
                         prefill_eviction_callback=prefill_eviction_callback,
                     )
                     try:
-                        await engine.start()
+                        await self._start_engine(engine)
                     except Exception as fallback_error:
                         raise RuntimeError(
                             f"LM load failed (force_lm=True): {start_error}; "
@@ -4158,7 +4194,7 @@ class EnginePool:
                         prefill_eviction_callback=prefill_eviction_callback,
                     )
                     try:
-                        await engine.start()
+                        await self._start_engine(engine)
                     except Exception as fallback_error:
                         raise RuntimeError(
                             f"VLM load failed: {start_error}; "
@@ -4396,6 +4432,10 @@ class EnginePool:
                 f"full model: {format_size(entry.estimated_size)}, "
                 f"total: {format_size(self._current_model_memory)})"
             )
+        except asyncio.CancelledError:
+            if not load_completed:
+                self._schedule_failed_load_reclaim(model_id, pre_load_memory)
+            raise
         except Exception as exc:
             # A failed load can leave tens of GB of just-loaded weights
             # reachable only through the propagating exception's traceback

@@ -725,9 +725,8 @@ class TestHFUploaderReadme:
         """Frontmatter-only README should be treated as empty and auto-generated."""
         oq_path = Path(model_dirs[0]) / "Llama-3B-oQ4"
         # Write a frontmatter-only stub (like mlx-lm default)
-        (oq_path / "README.md").write_text(
-            "---\nlanguage: en\nlibrary_name: mlx\ntags:\n- mlx\n---\n"
-        )
+        original_readme = "---\nlanguage: en\nlibrary_name: mlx\ntags:\n- mlx\n---\n"
+        (oq_path / "README.md").write_text(original_readme)
         uploader = HFUploader(model_dirs=model_dirs)
 
         with patch("huggingface_hub.HfApi") as MockApi:
@@ -755,3 +754,94 @@ class TestHFUploaderReadme:
             # Should contain auto-generated content, not the stub
             assert "# Llama-3B-oQ4" in readme_contents[0]
             assert "oQ" in readme_contents[0]
+            assert (oq_path / "README.md").read_text() == original_readme
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("readme_mode", ["source", "generated"])
+    @pytest.mark.parametrize("fail_upload", [False, True])
+    async def test_existing_readme_restored(self, model_dirs, readme_mode, fail_upload):
+        model_path = Path(model_dirs[0]) / "Llama-3B-oQ4"
+        readme = model_path / "README.md"
+        original = (
+            b"Original local card\r\n"
+            if readme_mode == "source"
+            else b"---\nlibrary_name: mlx\n---\n"
+        )
+        readme.write_bytes(original)
+        readme.chmod(0o640)
+        os.utime(readme, ns=(1_700_000_000_000_000_000,) * 2)
+        original_stat = readme.stat()
+        uploaded = []
+
+        def upload(**kwargs):
+            uploaded.append((Path(kwargs["folder_path"]) / "README.md").read_bytes())
+            if fail_upload:
+                raise RuntimeError("Upload failed")
+
+        uploader = HFUploader(model_dirs)
+        source = Path(model_dirs[0]) / "Llama-3B-Instruct"
+        (source / "README.md").chmod(0o444)
+        with patch("huggingface_hub.HfApi") as api:
+            api.return_value.upload_folder.side_effect = upload
+            task = await uploader.start_upload(
+                str(model_path),
+                "user/model",
+                "hf_token",
+                readme_source_path=str(source) if readme_mode == "source" else "",
+            )
+            await uploader._active_tasks[task.task_id]
+
+        assert task.status == (
+            UploadStatus.FAILED if fail_upload else UploadStatus.COMPLETED
+        )
+        assert len(uploaded) == 1
+        assert uploaded[0] != original
+        assert readme.read_bytes() == original
+        assert readme.stat().st_mode == original_stat.st_mode
+        assert readme.stat().st_mtime_ns == original_stat.st_mtime_ns
+
+    @pytest.mark.asyncio
+    async def test_existing_readme_symlink_and_target_are_preserved(self, model_dirs):
+        root = Path(model_dirs[0])
+        model_path = root / "Llama-3B-oQ4"
+        original = root / "local-card.md"
+        original.write_text("Original local card")
+        readme = model_path / "README.md"
+        readme.symlink_to(original)
+        uploader = HFUploader(model_dirs)
+
+        def upload(**kwargs):
+            assert original.read_text() == "Original local card"
+            assert "Llama 3B Instruct" in readme.read_text()
+
+        with patch("huggingface_hub.HfApi") as api:
+            api.return_value.upload_folder.side_effect = upload
+            task = await uploader.start_upload(
+                str(model_path),
+                "user/model",
+                "hf_token",
+                readme_source_path=str(root / "Llama-3B-Instruct"),
+            )
+            await uploader._active_tasks[task.task_id]
+        assert task.status == UploadStatus.COMPLETED
+        assert readme.is_symlink()
+        assert readme.resolve() == original
+        assert original.read_text() == "Original local card"
+
+    @pytest.mark.asyncio
+    async def test_readme_source_is_upload_directory(self, model_dirs):
+        model_path = Path(model_dirs[0]) / "Llama-3B-Instruct"
+        readme = model_path / "README.md"
+        original = readme.read_bytes()
+        uploader = HFUploader(model_dirs)
+        with patch("huggingface_hub.HfApi") as api:
+            task = await uploader.start_upload(
+                str(model_path),
+                "user/model",
+                "hf_token",
+                readme_source_path=str(model_path),
+            )
+            await uploader._active_tasks[task.task_id]
+        assert task.status == UploadStatus.COMPLETED
+        api.return_value.upload_folder.assert_called_once()
+        assert readme.read_bytes() == original
