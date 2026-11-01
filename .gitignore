@@ -59,6 +59,8 @@ cover/
 # Environments
 .env
 .venv
+.venv-3.12
+.pi
 env/
 venv/
 ENV/
