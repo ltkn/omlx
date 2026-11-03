@@ -965,3 +965,55 @@ def test_oq25_streams_v41_calibration_without_full_model_load(
     assert calibration["imatrix_cache_reused"] is False
     assert calibration["sensitivity"]
     assert calibration["calibration_model"] == str(source)
+
+
+def test_v41_export_surface_keeps_corpus_keywords_and_has_no_allocation_flag():
+    """The build scripts drive V4.1 through these keywords and no others.
+
+    ``calib_dataset``, ``sensitivity_calib_dataset`` and ``ngram_bits`` carry
+    the custom-corpus exports; ``legacy_allocation`` and ``always_on_rules``
+    would re-select a bit allocation the library no longer offers, so their
+    absence is the contract: a caller still passing them must fail at import
+    of the call, not silently quantize differently.
+    """
+    import inspect
+
+    from omlx.oq import _build_quant_plan, estimate_bpw_and_size, quantize_oq_streaming
+    from omlx.patches.deepseek_v41.oq import quantize as quantize_v41
+    from omlx.patches.deepseek_v41.oq_inventory import build_affine_plan
+
+    entry = inspect.signature(quantize_oq_streaming).parameters
+    estimate = inspect.signature(estimate_bpw_and_size).parameters
+    exporter = inspect.signature(quantize_v41).parameters
+    planner = inspect.signature(build_affine_plan).parameters
+    allocator = inspect.signature(_build_quant_plan).parameters
+
+    for keyword in ("calib_dataset", "sensitivity_calib_dataset", "ngram_bits"):
+        assert keyword in entry, keyword
+    assert "ngram_bits" in estimate
+    for keyword in (
+        "calib_dataset",
+        "sensitivity_calib_dataset",
+        "ngram_bits",
+        "stream_calibration",
+        "preserve_ngram_table",
+    ):
+        assert keyword in exporter, keyword
+    for keyword in ("ngram_bits", "preserve_ngram_table"):
+        assert keyword in entry, keyword
+
+    for name, parameters in (
+        ("quantize_oq_streaming", entry),
+        ("estimate_bpw_and_size", estimate),
+        ("deepseek_v41.quantize", exporter),
+        ("build_affine_plan", planner),
+        ("_build_quant_plan", allocator),
+    ):
+        assert "legacy_allocation" not in parameters, name
+        assert "always_on_rules" not in parameters, name
+
+    with pytest.raises(TypeError) as raised:
+        quantize_oq_streaming(
+            model_path="nowhere", output_path="also-nowhere", legacy_allocation=True
+        )
+    assert "legacy_allocation" in str(raised.value)

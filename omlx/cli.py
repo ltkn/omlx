@@ -190,8 +190,8 @@ def serve_command(args):
         build_number = None
 
     # Print version banner
-    print(f"\033[33moMLX - LLM inference, optimized for your Mac\033[0m")
-    print(f"\033[33m├─ https://github.com/jundot/omlx\033[0m")
+    print("\033[33moMLX - LLM inference, optimized for your Mac\033[0m")
+    print("\033[33m├─ https://github.com/jundot/omlx\033[0m")
     if build_number:
         print(f"\033[33m├─ Version: {__version__}\033[0m")
         print(f"\033[33m└─ Build: {build_number}\033[0m")
@@ -373,43 +373,14 @@ def serve_command(args):
             print(f"MCP config: {mcp_config}")
             os.environ["OMLX_MCP_CONFIG"] = mcp_config
 
-        # Determine paged SSD cache directory
-        # Priority: --no-cache > CLI arg > settings file
-        if args.no_cache:
-            paged_ssd_cache_dir = None
-        elif args.paged_ssd_cache_dir:
-            # CLI argument takes precedence
-            paged_ssd_cache_dir = args.paged_ssd_cache_dir
-        elif settings.cache.enabled:
-            # Use settings file value (resolved path or default)
-            paged_ssd_cache_dir = str(
-                settings.cache.get_ssd_cache_dir(settings.base_path)
-            )
-        else:
-            # Cache explicitly disabled in settings
-            paged_ssd_cache_dir = None
-
-        # Build scheduler config for BatchedEngine
+        # Build scheduler config for BatchedEngine. Settings already include
+        # the CLI args and leave the SSD cache dir unset when it is off.
         scheduler_config = settings.to_scheduler_config()
-        # Set paged SSD cache options
-        scheduler_config.paged_ssd_cache_dir = paged_ssd_cache_dir
-        # Determine cache max size: CLI arg > settings (with auto resolution)
+        if args.no_cache:
+            scheduler_config.paged_ssd_cache_dir = None
+        paged_ssd_cache_dir = scheduler_config.paged_ssd_cache_dir
         if paged_ssd_cache_dir:
-            if (
-                args.paged_ssd_cache_max_size
-                and args.paged_ssd_cache_max_size.lower() != "auto"
-            ):
-                # CLI argument specified explicitly
-                cache_max_size_bytes = parse_size(args.paged_ssd_cache_max_size)
-            else:
-                # Resolve the initial automatic budget from disk space and existing cache.
-                cache_max_size_bytes = settings.cache.get_ssd_cache_max_size_bytes(
-                    settings.base_path
-                )
-            scheduler_config.paged_ssd_cache_max_size = cache_max_size_bytes
-            scheduler_config.paged_ssd_cache_auto_size = (
-                args.paged_ssd_cache_max_size or settings.cache.ssd_cache_max_size
-            ).lower() == "auto"
+            cache_max_size_bytes = scheduler_config.paged_ssd_cache_max_size
         else:
             scheduler_config.paged_ssd_cache_max_size = 0
             cache_max_size_bytes = 0
@@ -449,6 +420,11 @@ def serve_command(args):
                 print(f"Hot cache: {hot_display} (in-memory)")
         else:
             print("Mode: Multi-model serving (continuous batching, no cache)")
+            if settings.cache.is_ssd_cache_dir_unavailable():
+                print(
+                    "paged SSD cache: off until restart, directory unavailable: "
+                    f"{settings.cache.unavailable_ssd_cache_dir}"
+                )
 
         # Set MLX buffer cache limit high to prevent the allocator from
         # immediately releasing Metal buffers when the cache is full.
@@ -551,6 +527,10 @@ def launch_command(args, extra_args: list[str] | None = None):
         print(f"oMLX server is not running at {base_url}")
         print("Start the server first: omlx start")
         sys.exit(1)
+    try:
+        default_model = _optional_str(resp.json().get("default_model")) or ""
+    except (ValueError, AttributeError):
+        default_model = ""
 
     # Get API key: CLI args > settings.json > empty
     api_key = getattr(args, "api_key", None) or settings.auth.api_key or ""
@@ -595,8 +575,9 @@ def launch_command(args, extra_args: list[str] | None = None):
         # The integration registers the server's whole model catalog, so
         # there is nothing to pick here; the optional per-tool default (or
         # --model) only seeds the tool's own default model.
+        setting_tool = "codex" if tool_name == "codex_app" else tool_name
         model = (
-            _optional_str(getattr(settings.integrations, f"{tool_name}_model", None))
+            _optional_str(getattr(settings.integrations, f"{setting_tool}_model", None))
             or ""
         )
     if not model and (cli_opus_model or cli_sonnet_model or cli_haiku_model):
@@ -693,6 +674,7 @@ def launch_command(args, extra_args: list[str] | None = None):
         port=port,
         api_key=api_key,
         model=model,
+        default_model=default_model,
         opus_model=opus_model if tool_name == "claude" else None,
         sonnet_model=sonnet_model if tool_name == "claude" else None,
         haiku_model=haiku_model if tool_name == "claude" else None,
@@ -878,7 +860,7 @@ def diagnose_menubar() -> int:
 
     mac_ver = platform.mac_ver()[0] or "unknown"
     print(f"macOS:          {mac_ver}")
-    print(f"Bundle ID:      app.omlx")
+    print("Bundle ID:      app.omlx")
 
     app_path = Path("/Applications/oMLX.app")
     print(f"App installed:  {'yes' if app_path.exists() else 'NO (install DMG first)'}")

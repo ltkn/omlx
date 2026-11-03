@@ -351,41 +351,44 @@ def test_affine_plan_preserves_vision_precision(
         )
 
 
-def test_affine_plan_forwards_legacy_allocation(monkeypatch):
+def test_affine_plan_lifts_attention_when_experts_exceed_target():
     from types import SimpleNamespace
 
-    from omlx import oq
     from omlx.patches.deepseek_v41.oq_inventory import build_affine_plan
 
-    expert = "language_model.layers.0.ffn.experts.w1"
-    inventory = {expert: dict(shape=(128, 64, 64), source_bytes=278528)}
-    imatrix = SimpleNamespace(entries={expert: SimpleNamespace(counts=np.ones(128))})
-    budget = dict(
-        remaining_weights=dict(logical_parameters=524288, tensor_bytes=278528)
+    # As in the release at oQ3: 3-bit experts plus the BF16 tensors kept at
+    # source precision already pass the target, so only the ladder, bounded
+    # by the cap, can raise a low-sensitivity layer's attention above its
+    # 4-bit floor.
+    experts = [f"language_model.layers.{i}.ffn.experts.w1" for i in range(4)]
+    attention = "language_model.layers.2.attn.wq_a"
+    kept = "language_model.layers.0.attn.wo_a"
+    inventory = {name: dict(shape=(128, 64, 64), source_bytes=0) for name in experts}
+    inventory[attention] = dict(shape=(64, 128), source_bytes=0)
+    inventory[kept] = dict(shape=(256, 128), source_bytes=65536)
+    imatrix = SimpleNamespace(
+        entries={
+            **{name: SimpleNamespace(counts=np.ones(128)) for name in experts},
+            attention: SimpleNamespace(counts=np.ones(1)),
+        }
     )
-    seen = {}
-    real = oq._build_quant_plan
-
-    def spy(*args, **kwargs):
-        seen.update(kwargs)
-        return real(*args, **kwargs)
-
-    monkeypatch.setattr(oq, "_build_quant_plan", spy)
-    build_affine_plan(
+    budget = dict(
+        remaining_weights=dict(logical_parameters=2138112, tensor_bytes=65536)
+    )
+    specs, report = build_affine_plan(
         inventory,
         budget,
         {"model_type": "deepseek_v41"},
         imatrix,
-        {"0": 0.5},
+        {0: 1.0, 1: 1.0, 2: 0.05, 3: 1.0},
         oq_level=3,
-        target=3.5,
-        cap=3.7,
-        legacy_allocation=True,
+        target=3.6,
+        cap=3.8,
     )
-    # V4.1 keeps its own exporter constraints but opts into the fixed Q8
-    # mandatory patterns through the shared allocator.
-    assert seen["legacy_allocation"] is True
-    assert seen["always_on_rules"] is False
+    assert all(specs[name]["bits"] == 3 for name in experts)
+    assert specs[attention] == dict(bits=8, group_size=64, mode="affine")
+    assert report["preserved_modules"][kept] == "uncalibrated"
+    assert 3.6 < report["effective_bpw"] <= 3.8
 
 
 @pytest.mark.parametrize(

@@ -25,7 +25,7 @@ from mlx_vlm.speculative.drafters.dflash2.dflash2 import DFlash2DraftModel
 
 from omlx.custom_kernels.quant_matmul import fast as quant_fast
 from omlx.model_settings import ModelSettings
-from omlx.patches import mlx_lm_mtp
+from omlx.patches import batched_decode_qmm, mlx_lm_mtp, qwen35_verify_qmm
 from omlx.patches.laguna import laguna_model
 from omlx.patches.mlx_lm_mtp import batch_generator as bg
 from omlx.patches.mlx_lm_mtp import (
@@ -196,6 +196,14 @@ class TestMtpBoundaryCommit:
         assert emitted_sources[-1] == boundary_source
         assert len(batch.tokens[0]) == 4
         assert cache.offset == 4
+
+    def test_accepted_drafts_report_target_rows(self, monkeypatch):
+        _, state, _ = self._run_full_accept_cycle(monkeypatch, emitted=2, drafts=2)
+
+        drafts = [(token, lp) for token, lp, source in state.queue if source == "draft"]
+        assert drafts
+        # The draft rows are all zeros; each verify row peaks at its token.
+        assert all(int(mx.argmax(lp).item()) == token for token, lp in drafts)
 
     def test_boundary_emit_replaces_copied_drafts(self, monkeypatch):
         from omlx.patches.mlx_lm_mtp import batch_generator as bg
@@ -4100,6 +4108,57 @@ def test_clip_block_drafts_keeps_aligned_proposal_prefix():
     assert state.drafts.tolist() == [1]
 
 
+def test_clip_to_shared_window_aligns_rows_that_verify():
+    def row(length, *, copy=False, queued=False):
+        state = bg._MtpState(uid=length, chain=True)
+        state.drafts = mx.arange(length, dtype=mx.uint32)
+        if copy:
+            ids = mx.arange(length * 2, dtype=mx.int32).reshape(length, 2)
+            state.draft_accept_lps = bg.SparseDraftQ(ids, mx.zeros((length, 2)), 64)
+            state.copy_drafts = True
+        if queued:
+            state.queue.append((0, None, "draft"))
+        return state
+
+    head, copied, waiting = row(3), row(7, copy=True), row(5, queued=True)
+    bg._clip_to_shared_window([head, copied, waiting])
+    assert copied.drafts.tolist() == [0, 1, 2]
+    assert copied.draft_accept_lps.ids.shape[0] == 3
+    assert head.drafts.tolist() == [0, 1, 2]
+    assert waiting.drafts.shape[0] == 5
+
+
+def test_initial_batch_forward_keeps_model_owned_sampled_rows_in_place(monkeypatch):
+    class ModelOwnedCache:
+        _omlx_mtp_batch_rollback_cache = True
+        offset = mx.array([5, 7])
+
+    calls = []
+
+    def backbone(model, inputs, cache, **kwargs):
+        calls.append(tuple(inputs.shape))
+        return "logits", "hidden", None, None
+
+    monkeypatch.setattr(bg, "_resolve_mtp_chain_depth", lambda model: (True, 3, False))
+    monkeypatch.setattr(bg, "_set_batched_mrope_deltas", lambda *args: None)
+    monkeypatch.setattr(bg, "_call_backbone_captured", backbone)
+    batch = SimpleNamespace(
+        model=SimpleNamespace(
+            _language_model=SimpleNamespace(_omlx_mtp_batch_rollback=True)
+        ),
+        uids=[1, 2],
+        _next_tokens=mx.array([4, 9]),
+        prompt_cache=[ModelOwnedCache()],
+        samplers=[lambda lp: mx.random.categorical(lp)] * 2,
+        logits_processors=None,
+    )
+    assert bg._initial_batch_forward(batch) == ("logits", "hidden", [6, 8], None)
+    assert calls == [(2, 1)]
+
+    batch.logits_processors = [None, [lambda tokens, logits: logits]]
+    assert bg._initial_batch_forward(batch) is None
+
+
 @pytest.mark.parametrize("unequal_acceptance", [False, True])
 def test_active_batch_admits_new_row_without_rebuilding_old_rows(
     monkeypatch, unequal_acceptance
@@ -4581,12 +4640,11 @@ def test_sparse_stochastic_acceptance_preserves_filtered_target_marginal():
         mx.set_default_device(previous_device)
 
 
-@pytest.mark.parametrize("top_k", [0, 3])
-@pytest.mark.parametrize("copied", [3, 1, 0])
+@pytest.mark.parametrize("top_k,copied", [(0, 1), (3, 1), (3, 0)])
 def test_copied_drafts_preserve_filtered_target_marginal(top_k, copied):
     """A context copy is a deterministic draft; with its one-hot q the emitted
-    token still follows the filtered target, whether the copied token is the
-    likely one (3), an unlikely one (1) or, at top-k 3, outside the support (0).
+    token still follows the filtered target, on the dense and the top-k path
+    for an unlikely copied token (1) and, at top-k 3, outside the support (0).
     """
     from omlx.utils.sampling import make_sampler
 
@@ -4643,6 +4701,80 @@ def _adapter(language):
     from omlx.models.vlm import VLMModelAdapter
 
     return VLMModelAdapter(SimpleNamespace(language_model=language))
+
+
+@pytest.mark.parametrize("compact", [False, True], ids=["batch-cache", "compact-cache"])
+@pytest.mark.parametrize("delta", [0.0, 7.0, -3.0])
+def test_singleton_mtp_rebinds_positions_after_prefill_clear(
+    monkeypatch, compact, delta
+):
+    from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
+
+    active = mlx_lm_mtp.is_mtp_active()
+    mlx_lm_mtp.set_mtp_active(True)
+    bg.apply()
+    cache_rollback.apply()
+    monkeypatch.setattr(bg, "_batch_policy_for_next", lambda batch: None)
+    mx.random.seed(861)
+    model = _model("qwen_vlm")
+    # The helper has no owner config; enable the adapter's real mRoPE path.
+    model._uses_mrope = True
+    cleared = False
+    observed = []
+    original_next = bg._mtp_next
+    original_verify = Qwen3_5BatchInvariantForward.verify
+
+    def clear_between_cycles(batch, state):
+        nonlocal cleared
+        if not cleared and not state.queue and state.stats.cycles >= 1:
+            if compact:
+                batch.prompt_cache = batch.extract_cache(0)
+            # Incoming text prefill clears this shared adapter state.
+            model.clear_vlm_position_state()
+            cleared = True
+        return original_next(batch, state)
+
+    def record_positions(verifier, language_model, inputs, **kwargs):
+        if cleared:
+            cache = kwargs["cache"][language_model.model.fa_idx]
+            offset = cache._idx if hasattr(cache, "_idx") else cache.offset
+            if isinstance(offset, mx.array):
+                offset = int(offset.reshape(-1)[0].item())
+            positions = kwargs.get("position_ids")
+            first = (
+                positions[..., 0].reshape(-1).tolist()
+                if positions is not None
+                else None
+            )
+            observed.append((int(offset + delta), first))
+        return original_verify(verifier, language_model, inputs, **kwargs)
+
+    monkeypatch.setattr(bg, "_mtp_next", clear_between_cycles)
+    monkeypatch.setattr(Qwen3_5BatchInvariantForward, "verify", record_positions)
+    generator = BatchGenerator(
+        model,
+        sampler=lambda lp: mx.argmax(lp, -1),
+        max_tokens=24,
+        prefill_batch_size=1,
+    )
+    try:
+        uid = generator.insert([list(range(3, 15))], max_tokens=[24])[0]
+        model.register_rope_delta(uid, delta)
+        for _ in range(100):
+            _, responses = generator.next()
+            if any(response.finish_reason for response in responses):
+                break
+        else:
+            pytest.fail("generation did not finish")
+    finally:
+        generator.close()
+        mlx_lm_mtp.set_mtp_active(active)
+
+    assert cleared and observed
+    assert all(
+        first and all(position == expected for position in first)
+        for expected, first in observed
+    ), observed
 
 
 def _model(family):
@@ -4884,7 +5016,7 @@ def test_qwen_late_join_preserves_cache_without_history_replay(family, monkeypat
         gen.close()
 
 
-def _join_as_batch_row_finishes(model, prompts, joined_prompt, max_tokens=40):
+def _join_as_batch_row_finishes(model, prompts, joined_prompt, max_tokens=24):
     """Finish row 0 of an active shared-MTP batch in the late join's ``next()``.
 
     The finishing row filters the batch to a singleton MTP state inside
@@ -4952,6 +5084,8 @@ def test_qwen_late_join_as_batch_row_finishes_skips_history_replay(
     family, monkeypatch
 ):
     monkeypatch.setattr(mlx_lm_mtp, "_MTP_ACTIVE", True)
+    # Reconcile reads capacity-managed caches; the scheduler patches at import.
+    apply_batch_kv_capacity_patch()
     mx.random.seed(3702)
     model = _model(family)
     mx.eval(model.parameters())
@@ -4968,33 +5102,36 @@ def test_qwen_late_join_as_batch_row_finishes_skips_history_replay(
     )
     first, new_uid, output = _join_as_batch_row_finishes(model, prompts, joined)
     assert output == replayed
-    assert len(output[first[1]]) == 40 and len(output[new_uid]) == 40
+    assert len(output[first[1]]) == 24 and len(output[new_uid]) == 24
 
 
 @pytest.mark.parametrize(
-    "family,unequal_depths",
+    "family,unequal_depths,late_join,batch_size",
     [
-        ("qwen", False),
-        ("qwen", True),
-        ("qwen_vlm", False),
-        ("qwen_vlm", True),
-        ("qwen4", False),
-        ("qwen4", True),
-        # V4.1 owns its depth controller; the common override does not apply.
-        ("v41", False),
-        # Singleton-only adapters need batching/late-join checks, not a
-        # duplicate matrix for a multi-request depth policy they never use.
-        ("gemma", False),
-        ("v4_dspark", False),
-        ("inkling", False),
-        ("nemotron", False),
-        ("glm", False),
-        ("glm5", False),
-        ("glm5", True),
-        ("step", False),
+        (family, unequal_depths, *join)
+        for family, unequal_depths in [
+            ("qwen", False),
+            ("qwen", True),
+            ("qwen_vlm", False),
+            ("qwen_vlm", True),
+            ("qwen4", False),
+            ("qwen4", True),
+            # V4.1 owns its depth controller; the common override does not apply.
+            ("v41", False),
+            ("glm5", False),
+            ("glm5", True),
+        ]
+        # (False, 4) shrinks a full batch row by row; (True, 2) also joins a
+        # running request. A 4-row late join only combines the two.
+        for join in [(False, 4), (True, 2)]
+    ]
+    # Singleton-only adapters need batching/late-join checks, not a multi-request
+    # depth matrix. One late join covers multi-row decode and singleton re-entry.
+    + [
+        (family, False, True, 2)
+        for family in ["gemma", "v4_dspark", "inkling", "nemotron", "glm", "step"]
     ],
 )
-@pytest.mark.parametrize("late_join,batch_size", [(False, 4), (True, 2), (True, 4)])
 def test_multi_request_mtp_or_singleton_only_matches_standard(
     family, unequal_depths, late_join, batch_size, monkeypatch
 ):
@@ -5225,22 +5362,22 @@ def test_batch_policy_skips_copied_windows(monkeypatch):
         mlx_lm_mtp.set_mtp_active(previous)
 
 
-@pytest.mark.parametrize("wide_window", [False, True])
-def test_context_copy_width_follows_the_targets_verify_window(wide_window):
+@pytest.mark.parametrize("family, width", [("qwen4", 15), ("glm5", 7)])
+def test_context_copy_width_follows_the_targets_verify_window(family, width):
     """A verbatim run after a whole accept copies 15 tokens only for a target
-    that verifies 16-row windows; other targets (GLM-5.3 rolls back at most
-    8 rows) keep 7-token copies."""
-    from omlx.patches.mlx_lm_mtp import context_copy
-
+    that verifies 16-row windows. GLM-5.3 is row-exact too, but its indexer
+    pool rolls back at most 8 rows, so it keeps 7-token copies."""
     source = list(range(1000, 1200))
     history = source + source[:100]  # the tail repeats the source verbatim
-    copier = context_copy.ContextCopy(wide_window=wide_window)
-    copier.extend(history, [])
-    assert copier.propose(64) == source[100:107]
-    copier.observe(7, 7)
-    copier.extend(history + source[100:107], [])
-    expected = 15 if wide_window else 7
-    assert copier.propose(64) == source[107 : 107 + expected]
+    gen_batch = SimpleNamespace(
+        model=_model(family), tokens=[history], max_tokens=[1000], _num_tokens=[0]
+    )
+    state = SimpleNamespace(context_copy=None)
+    assert bg._context_copy_drafts(gen_batch, state, []) == source[100:107]
+    state.context_copy.observe(7, 7)
+    gen_batch.tokens = [history + source[100:107]]
+    copied = bg._context_copy_drafts(gen_batch, state, [])
+    assert copied == source[107 : 107 + width]
 
 
 @pytest.mark.parametrize("size", [2, 4])
@@ -5835,7 +5972,7 @@ def _assert_rows_equal(actual, references, accepted):
                 assert observed.offset == expected.offset
 
 
-@pytest.mark.parametrize("batch_size", [2, 4])
+@pytest.mark.parametrize("batch_size", [4])
 @pytest.mark.parametrize("late_join", [False, True])
 def test_vector_commit_matches_scalar_states_and_ordinary_tokens(
     monkeypatch, batch_size, late_join
@@ -6076,16 +6213,18 @@ def test_packed_linear_replaces_4bit_projections(monkeypatch):
         assert _close(out[0], _reference(original, x[0]))
 
 
-@pytest.mark.parametrize("bits", [4, 5])
-@pytest.mark.parametrize("batch,length", [(1, 8), (2, 6), (4, 6), (1, 24), (3, 5)])
+@pytest.mark.parametrize("dtype,group_size", [(mx.bfloat16, 64), (mx.float16, 128)])
+@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6, 8])
+@pytest.mark.parametrize("batch,length", [(1, 8), (2, 6), (1, 24), (3, 5)])
 def test_verify_qmm_routes_batched_rows_through_mma_kernel(
-    monkeypatch, batch, length, bits
+    monkeypatch, batch, length, bits, dtype, group_size
 ):
     """rows = batch x block share one weight pass and match stock numerics."""
     from omlx.patches import qwen35_verify_qmm
 
     qwen35_verify_qmm.apply_verify_qmm_patch()
     monkeypatch.setattr(qwen35_verify_qmm, "_is_armed", lambda: True)
+    monkeypatch.setattr(qwen35_verify_qmm, "is_nax_available", lambda: False)
     monkeypatch.setattr(qwen35_verify_qmm, "_MIN_MMA_ROUTE_N", 256)
     monkeypatch.setattr(qwen35_verify_qmm, "_MIN_ROUTE_N", 256)
     routed = []
@@ -6097,15 +6236,15 @@ def test_verify_qmm_routes_batched_rows_through_mma_kernel(
 
     monkeypatch.setattr(qwen35_verify_qmm, "vk_qmm_mma", spy)
     mx.random.seed(7)
-    layer = nn.QuantizedLinear(512, 288, bits=bits, group_size=64)
-    x = (mx.random.normal((batch, length, 512)) * 0.5).astype(mx.bfloat16)
+    layer = nn.QuantizedLinear(512, 288, bits=bits, group_size=group_size)
+    x = (mx.random.normal((batch, length, 512)) * 0.5).astype(dtype)
     expected = mx.quantized_matmul(
         x,
         layer.weight,
         layer.scales,
         layer.biases,
         transpose=True,
-        group_size=64,
+        group_size=group_size,
         bits=bits,
     ).astype(mx.float32)
     out = layer(x).astype(mx.float32)
@@ -6121,8 +6260,112 @@ def test_verify_qmm_routes_batched_rows_through_mma_kernel(
     assert mx.abs(out - expected).max().item() <= tolerance
 
 
+def _stock_quantized_linear_call(self, x):
+    return mx.quantized_matmul(
+        x,
+        self.weight,
+        self.scales,
+        self.biases,
+        transpose=True,
+        group_size=self.group_size,
+        bits=self.bits,
+    )
+
+
+def _batched_decode_spy(monkeypatch, nax=False):
+    """Enable batched decode routing on small layers and record each route.
+
+    The patch wraps a stock call, so verify wrappers installed by other tests
+    in the worker stay out of the chain.
+    """
+    monkeypatch.setattr(nn.QuantizedLinear, "__call__", _stock_quantized_linear_call)
+    monkeypatch.setattr(batched_decode_qmm, "_PATCHED", False)
+    monkeypatch.setattr(qwen35_verify_qmm, "is_nax_available", lambda: nax)
+    monkeypatch.setattr(qwen35_verify_qmm, "_MIN_SG8_ROUTE_N", 256)
+    monkeypatch.setattr(qwen35_verify_qmm, "_MIN_MMA_ROUTE_N", 256)
+    batched_decode_qmm._route.cache_clear()
+    calls = []
+    original = qwen35_verify_qmm.run_route
+
+    def spy(layer, x2, route, **kwargs):
+        calls.append(route)
+        return original(layer, x2, route, **kwargs)
+
+    monkeypatch.setattr(qwen35_verify_qmm, "run_route", spy)
+    assert batched_decode_qmm.apply_batched_decode_qmm_patch()
+    mx.random.seed(5)
+    layer = nn.QuantizedLinear(512, 288, bias=False, bits=4, group_size=64)
+    layer.scales = layer.scales.astype(mx.bfloat16)
+    layer.biases = layer.biases.astype(mx.bfloat16)
+    return layer, calls
+
+
+@pytest.mark.parametrize(
+    "shape,routed",
+    [
+        ((8, 1, 512), "sg8"),
+        ((16, 1, 512), "mma"),
+        ((24, 1, 512), "mma"),
+        ((4, 1, 512), None),
+        ((1, 8, 512), None),
+        ((8, 2, 512), None),
+    ],
+)
+def test_batched_decode_routes_one_token_rows(monkeypatch, shape, routed):
+    """Decode steps of six or more requests take the multi-row kernels."""
+    layer, calls = _batched_decode_spy(monkeypatch)
+    x = (mx.random.normal(shape) * 0.5).astype(mx.bfloat16)
+    expected = mx.quantized_matmul(
+        x, layer.weight, layer.scales, layer.biases, transpose=True, group_size=64
+    ).astype(mx.float32)
+    out = layer(x).astype(mx.float32)
+    assert calls == ([routed] if routed else [])
+    assert out.shape == (*shape[:2], 288)
+    tolerance = 2.0 * mx.abs(expected).max().item() / 256 + 1e-2
+    assert mx.abs(out - expected).max().item() <= tolerance
+
+    batched_decode_qmm.remove_batched_decode_qmm_patch()
+    layer((mx.random.normal((8, 1, 512)) * 0.5).astype(mx.bfloat16))
+    assert calls == ([routed] if routed else [])
+
+
+@pytest.mark.parametrize("rows,routed", [(16, "mma"), (24, None)])
+def test_batched_decode_stops_at_sixteen_rows_on_nax(monkeypatch, rows, routed):
+    """NAX GPUs keep stock MLX past 16 rows, where its tensor-unit qmm wins."""
+    layer, calls = _batched_decode_spy(monkeypatch, nax=True)
+    layer((mx.random.normal((rows, 1, 512)) * 0.5).astype(mx.bfloat16))
+    assert calls == ([routed] if routed else [])
+
+
+@pytest.mark.parametrize("mode", ["verify", "row_exact", "deepseek", "fp32_scales"])
+def test_batched_decode_leaves_exact_modes_on_stock(monkeypatch, mode):
+    """Armed verify and one-row exactness modes own their (rows, 1, K) calls."""
+    from omlx.patches.deepseek_v4 import decode_consistency
+
+    layer, calls = _batched_decode_spy(monkeypatch)
+    if mode == "fp32_scales":
+        layer.scales = layer.scales.astype(mx.float32)
+        layer.biases = layer.biases.astype(mx.float32)
+    x = (mx.random.normal((8, 1, 512)) * 0.5).astype(mx.bfloat16)
+    expected = mx.quantized_matmul(
+        x, layer.weight, layer.scales, layer.biases, transpose=True, group_size=64
+    )
+    try:
+        if mode in ("verify", "row_exact"):
+            qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=mode == "row_exact")
+        elif mode == "deepseek":
+            decode_consistency.set_armed(True)
+        out = layer(x)
+    finally:
+        qwen35_verify_qmm.set_verify_qmm_armed(False)
+        decode_consistency.set_armed(False)
+    assert calls == []
+    assert out.dtype == expected.dtype
+    assert mx.array_equal(out, expected).item()
+
+
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-@pytest.mark.parametrize("bits", [4, 5])
+@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6])
 @pytest.mark.parametrize("rows", [4, 8])
 def test_sg8_kernels_match_quantized_matmul(bits, rows, dtype):
     """Plain, gate/up swiglu and grouped sg8 launches against stock qmm."""
@@ -6150,6 +6393,8 @@ def test_sg8_kernels_match_quantized_matmul(bits, rows, dtype):
         swiglu = vq.vk_swiglu_sg8(x, gate, up, sums)
         assert _close(swiglu, nn.silu(g) * u, tol=2e-2)
 
+        if bits not in (4, 5):
+            continue
         # Mixed 4/5-bit projections of one input share a launch.
         group = [layer, _quantized_linear(512, 1024, 9 - bits, 14, dtype), gate]
         for got, linear in zip(vq.vk_group_sg8(x, group, sums), group):

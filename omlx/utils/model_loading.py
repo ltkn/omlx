@@ -10,7 +10,7 @@ from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten
+from mlx.utils import tree_flatten, tree_unflatten
 
 from ..patches.arrays_cache_metadata import apply_arrays_cache_metadata_patch
 from ..patches.mlx_vlm_minimax_m3_compat import adopt_expert_global_scales
@@ -418,8 +418,14 @@ def normalize_bailing_hybrid_fp8_quant(cfg: dict) -> dict:
             "bits": 4,
             "mode": "mxfp4",
         }
-        for layer_idx in range(first_sparse_layer, num_hidden_layers):
-            base = f"model.layers.{layer_idx}.mlp.switch_mlp"
+        bases = [
+            f"model.layers.{layer_idx}.mlp.switch_mlp"
+            for layer_idx in range(first_sparse_layer, num_hidden_layers)
+        ]
+        # Sanitize moves the nextn layer, MXFP4 experts included, to mtp.0.
+        if int(cfg.get("num_nextn_predict_layers") or 0):
+            bases.append("mtp.0.mlp.switch_mlp")
+        for base in bases:
             for projection in ("gate_proj", "up_proj", "down_proj"):
                 quantization[f"{base}.{projection}"] = dict(expert_quantization)
 
@@ -623,6 +629,10 @@ def maybe_apply_pre_load_patches(
 
     apply_arrays_cache_extract_guard()
 
+    from ..patches.batched_decode_qmm import apply_batched_decode_qmm_patch
+
+    apply_batched_decode_qmm_patch()
+
     # Model-independent: unused ArraysCache padding metadata otherwise grows
     # lazy graphs until a long-lived BatchGenerator hits the Metal resource limit.
     apply_arrays_cache_metadata_patch()
@@ -652,8 +662,9 @@ def maybe_apply_pre_load_patches(
     # wrapper chain bypasses us entirely.
     quant_cfg = config.get("quantization") or {}
     quant_bits = quant_cfg.get("bits") if isinstance(quant_cfg, dict) else None
-    # Ordinary 2-bit affine checkpoints do not need the t5 loading shim.
-    if quant_bits == 1 or (quant_bits == 2 and _checkpoint_has_t5_weights(model_name)):
+    # Ordinary 1-bit and 2-bit affine checkpoints run on stock MLX kernels.
+    has_t5_weights = quant_bits == 2 and _checkpoint_has_t5_weights(model_name)
+    if has_t5_weights:
         try:
             from ..patches.bonsai_t5_load import apply_bonsai_t5_load_patch
         except Exception as e:
@@ -663,24 +674,6 @@ def maybe_apply_pre_load_patches(
                 logger.info(
                     "Bonsai t5 load patch applied for %s "
                     "(t5 uint8 weights allowed past strict shape check)",
-                    model_name,
-                )
-
-    # Bonsai 1-bit construction patch: stock mlx-lm calls
-    # nn.quantize(model, bits=1) before our inference patches hook in,
-    # and mx.quantize(bits=1) is rejected at the C++ level.  Patch
-    # mx.quantize to emit uint32-packed placeholder tensors in the 1-bit
-    # shape (K//32 values per uint32); real weights bind via load_weights.
-    # bits=2 needs no shim (stock mx.quantize handles it).
-    if quant_bits == 1:
-        try:
-            from ..patches.bonsai_qmv import apply_bonsai_construct_patch
-        except Exception as e:
-            logger.debug("bonsai construct patch import failed: %s", e)
-        else:
-            if apply_bonsai_construct_patch():
-                logger.info(
-                    "Bonsai 1-bit construct patch applied for %s",
                     model_name,
                 )
 
@@ -1181,32 +1174,6 @@ def maybe_apply_pre_load_patches(
                     model_name,
                 )
 
-    # Bonsai 1-bit / 2-bit affine quantized decode patch.
-    # Applies to any model whose top-level ``quantization`` config declares
-    # bits=1 or bits=2 (the keys written by the Bonsai MLX conversion).
-    # The patch is a no-op for stock 4/8-bit models so it is safe to install
-    # globally once for the process lifetime.
-    quant_cfg = config.get("quantization") or {}
-    quant_bits = quant_cfg.get("bits") if isinstance(quant_cfg, dict) else None
-    if quant_bits in (1, 2):
-        try:
-            from ..patches.bonsai_qmv import apply_bonsai_qmv_patch
-        except Exception as e:
-            logger.debug("1/2-bit affine decode optimization import failed: %s", e)
-        else:
-            if apply_bonsai_qmv_patch():
-                logger.info(
-                    "%d-bit affine decode optimization enabled for %s",
-                    quant_bits,
-                    model_name,
-                )
-            else:
-                logger.debug(
-                    "1/2-bit affine decode optimization skipped for %s "
-                    "(native extension not available; stock mlx fallback active)",
-                    model_name,
-                )
-
 
 def _has_dspark_heads(config: dict) -> bool:
     """True for checkpoints with an embedded DSpark drafter."""
@@ -1442,9 +1409,9 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
 
     Supports Qwen3.5/3.6 (mlx-lm PR 990), DeepSeek-V4-Flash (Blaizzy/mlx-lm
     fork PR 15), MiMo V2/2.6 Flash, GLM-5.2 (glm_moe_dsa), Nemotron-H hybrids
-    (nemotron_h) and Gemma 4 merged-assistant checkpoints (gemma4 and
-    gemma4_unified, VLM path only). The model also has to declare MTP heads in
-    the config; otherwise the patch is a no-op.
+    (nemotron_h), Ling 3.x Flash (bailing_hybrid) and Gemma 4 merged-assistant
+    checkpoints (gemma4 and gemma4_unified, VLM path only). The model also has
+    to declare MTP heads in the config; otherwise the patch is a no-op.
     """
     if not _has_mtp_heads(config):
         return False
@@ -1461,6 +1428,7 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
         or model_type in ("gemma4", "gemma4_unified")
         or model_type in ("inkling", "inkling_mm_model")
         or model_type == "step3p7"
+        or model_type == "bailing_hybrid"
     )
 
 
@@ -1584,6 +1552,103 @@ def materialize_lazy_state(model: Any) -> None:
         # command buffer; small models see only a handful of chunks. See #3179.
         for start in range(0, len(arrays), _MATERIALIZE_EVAL_CHUNK):
             mx.eval(arrays[start : start + _MATERIALIZE_EVAL_CHUNK])
+
+
+def checkpoint_has_bf16_leaves(model_path: str) -> bool:
+    """Whether the checkpoint on disk still carries bfloat16 tensors.
+
+    The fp16 activation recast only has work to do when it does: a checkpoint
+    already stored in float16 makes the toggle a no-op, so the admin UI uses
+    this to gate it out. Reads only the safetensors headers (a few KB each) and
+    stops at the first bfloat16 tensor.
+    """
+    if not model_path:
+        return False
+    try:
+        shards = sorted(Path(model_path).glob("*.safetensors"))
+    except OSError:
+        return False
+    for shard in shards:
+        try:
+            with open(shard, "rb") as handle:
+                header_len = int.from_bytes(handle.read(8), "little")
+                header = json.loads(handle.read(header_len))
+        except (OSError, ValueError):
+            continue
+        for name, spec in header.items():
+            if (
+                name != "__metadata__"
+                and isinstance(spec, dict)
+                and spec.get("dtype") == "BF16"
+            ):
+                return True
+    return False
+
+
+def cast_bf16_params_to_fp16(model: Any) -> int:
+    """Recast every bfloat16 parameter of a loaded model to float16.
+
+    M1/M2 GPUs emulate bfloat16 but run float16 natively. The activation dtype
+    follows the non-quantized leaves (scales, biases, norms, embeddings), so
+    recasting them moves the forward onto the native path. Quantized U32
+    payloads are untouched.
+
+    A value outside the float16 range raises ValueError before any leaf
+    changes. Leaves are then swapped one chunk at a time, so peak memory grows
+    by one chunk instead of a second copy of every bfloat16 leaf.
+
+    Returns the number of tensors recast.
+    """
+    pending = [
+        (key, value)
+        for key, value in tree_flatten(model.parameters())
+        if isinstance(value, mx.array) and value.dtype == mx.bfloat16
+    ]
+    count = len(pending)
+    fp16_max = mx.finfo(mx.float16).max
+    # Reductions only, so this pass allocates no tensor-sized temporaries.
+    for start in range(0, count, _MATERIALIZE_EVAL_CHUNK):
+        bounds = [
+            bound
+            for _, value in pending[start : start + _MATERIALIZE_EVAL_CHUNK]
+            for bound in (mx.max(value), mx.min(value))
+        ]
+        mx.eval(bounds)
+        if any(abs(bound.item()) > fp16_max for bound in bounds):
+            raise ValueError("a bfloat16 tensor exceeds the float16 range")
+    while pending:
+        # Rebinding ``pending`` drops the previous chunk's bfloat16 originals.
+        chunk = pending[:_MATERIALIZE_EVAL_CHUNK]
+        pending = pending[_MATERIALIZE_EVAL_CHUNK:]
+        converted = [(key, value.astype(mx.float16)) for key, value in chunk]
+        mx.eval([value for _, value in converted])
+        # mx.eval returns once the float16 copies are ready, but the command
+        # buffer's completion handler still holds the bfloat16 inputs; wait
+        # for it so they are freed before the next chunk allocates.
+        mx.synchronize()
+        model.update(tree_unflatten(converted))
+        del chunk, converted
+    if count:
+        # Read by numerics_revision_for_model so bfloat16 KV blocks are not reused.
+        model._omlx_fp16_recast = True
+    return count
+
+
+def apply_activation_fp16(model: Any, model_settings: Any = None) -> None:
+    """Run the float16 recast when the model settings enable it."""
+    if not getattr(model_settings, "activation_fp16_enabled", False):
+        return
+    try:
+        recast = cast_bf16_params_to_fp16(model)
+    except Exception:
+        logger.warning(
+            "fp16 activation recast failed; staying on bfloat16", exc_info=True
+        )
+        return
+    if recast:
+        logger.info("activation dtype: bfloat16 -> float16 (%d tensors)", recast)
+    else:
+        logger.info("activation dtype: no bfloat16 leaves; nothing to recast")
 
 
 def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:

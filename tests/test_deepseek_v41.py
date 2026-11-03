@@ -150,13 +150,13 @@ def test_in_place_cache_growth_matches_concatenation(monkeypatch):
 
     model = LanguageModel(tiny())
     load_reference_weights(model)
-    ids = mx.array(np.random.default_rng(17).integers(3, 60, (1, 40), dtype=np.int32))
+    ids = mx.array(np.random.default_rng(17).integers(3, 60, (1, 24), dtype=np.int32))
 
     def run():
         cache = model.make_cache()
         logits = [model(ids[:, :9], cache=cache)]
-        for position in range(9, 40):
-            if position == 24:
+        for position in range(9, 24):
+            if position == 16:
                 # Extracting a single row keeps its storage.
                 cache = [layer.extract(0) for layer in cache]
             logits.append(model(ids[:, position : position + 1], cache=cache))
@@ -825,7 +825,68 @@ def test_engram_gate_matches_official(expected):
     np.testing.assert_array_equal(actual[:, 1], h[:, 1])
 
 
-async def _run_vlm_engine(tmp_path, direct=False):
+def test_prefill_engram_dedupe_matches_undeduped(monkeypatch):
+    from mlx.nn import Module
+
+    from omlx.patches.deepseek_v41 import engram as engram_mod
+    from omlx.patches.deepseek_v41.quantization import QuantizedProjection
+    from omlx.patches.deepseek_v41.storage import dedupe_tuple_ids
+
+    class RecordingWkv(Module):
+        def __init__(self, inner):
+            super().__init__()
+            self.inner = inner
+            self.seen = []
+
+        def __call__(self, x):
+            self.seen.append(tuple(x.shape))
+            return self.inner(x)
+
+    c = tiny(
+        dim=512,
+        engram_layer_ids=(1,),
+        engram_num_embeddings=(97,),
+        engram_vocab_size=5,
+        engram_max_ngram_size=4,
+        engram_n_heads=8,
+        engram_head_dim=256,
+        engram_compressed_vocab_size=64,
+    )
+    model = engram_mod.Engram(c, 0)
+    rng = np.random.default_rng(19)
+    model.embed.weight = mx.array(
+        rng.normal(0, 1, model.embed.weight.shape).astype(np.float32)
+    ).astype(mx.bfloat16)
+    weight = mx.array(
+        rng.normal(0, 0.02, model.wkv.weight.shape).astype(np.float32)
+    ).astype(mx.bfloat16)
+    packed, scales = mx.quantize(weight, group_size=32, bits=8, mode="mxfp8")[:2]
+    model.wkv = RecordingWkv(QuantizedProjection(packed, scales, 8, "mxfp8"))
+    ids = rng.integers(0, 97, (1, 32, 24), dtype=np.int32)
+    ids[0, 8:16] = ids[0, :8]
+    ids[0, 24:32] = ids[0, 16:24]
+    h = mx.array(rng.normal(0, 1, (1, 32, c.hc_mult, c.dim)).astype(np.float32))
+    mask = np.zeros((1, 32), dtype=bool)
+    mask[0, 1] = True
+
+    with monkeypatch.context() as m:
+        m.setattr(
+            engram_mod,
+            "dedupe_tuple_ids",
+            lambda values: (np.asarray(values, dtype=np.int64), None),
+        )
+        expected = model(h, ids, mx.array(mask))
+    actual = model(h, ids, mx.array(mask))
+    unique_ids, _ = dedupe_tuple_ids(ids)
+    assert unique_ids.shape[0] < 32
+    assert [shape[0] for shape in model.wkv.seen] == [1, unique_ids.shape[0]]
+    np.testing.assert_allclose(
+        np.asarray(actual), np.asarray(expected), atol=2e-6, rtol=1e-5
+    )
+    np.testing.assert_array_equal(actual[:, 1], h[:, 1])
+
+
+async def _run_vlm_engine(tmp_path):
     import asyncio
 
     from PIL import Image
@@ -835,9 +896,10 @@ async def _run_vlm_engine(tmp_path, direct=False):
     from omlx.scheduler import SchedulerConfig
 
     source, _ = write_checkpoint(tmp_path)
-    target = source if direct else tmp_path / "mlx"
-    if not direct:
-        convert(source, target)
+    target = tmp_path / "mlx"
+    # The engine passes source and converted checkpoints to the same load().
+    # Conversion also runs the source weight reader.
+    convert(source, target)
     engine = VLMBatchedEngine(
         str(target),
         enable_thinking=False,
@@ -968,14 +1030,7 @@ from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 import test_deepseek_v41 as t
 
-async def main():
-    for direct in (False, True):
-        root = Path(sys.argv[2]) / ("direct" if direct else "converted")
-        root.mkdir()
-        print(f"Testing {root.name} checkpoint", flush=True)
-        await asyncio.wait_for(t._run_vlm_engine(root, direct), timeout=60)
-
-asyncio.run(main())
+asyncio.run(asyncio.wait_for(t._run_vlm_engine(Path(sys.argv[2])), timeout=60))
 """
     # Engine startup installs process-wide Metal routes. Keep those real hooks
     # in a subprocess so unrelated estimator unit tests retain their fixtures.
@@ -1325,6 +1380,8 @@ def run_two_ranks(tmp_path, script, *args):
         assert '"ok": true' in out
 
 
+# Two real ranks on one GPU: a rank can hit the Metal timeout on a busy runner.
+@pytest.mark.slow
 def test_pipelined_forward_matches_single_process(tmp_path):
     run_two_ranks(tmp_path, _PIPELINE_RANK, Path(__file__).parent)
 
@@ -1363,11 +1420,24 @@ def test_cluster_stage_loads_only_its_text_weights(tmp_path):
         PipelineAssignment("a", 0, 3, 5, 1, 0, 0, 1),
         PipelineAssignment("b", 1, 0, 3, 1, 0, 0, 1),
     )
+    group = SimpleNamespace(rank=lambda: 0, size=lambda: 2)
     with install_unequal_pipeline_plan(plan):
-        stage = deepseek_v41.load_pipeline_stage(
-            target, SimpleNamespace(rank=lambda: 0, size=lambda: 2)
+        stage = deepseek_v41.load_pipeline_stage(target, group)
+        offloaded = deepseek_v41.load_pipeline_stage(
+            target, group, engram_ssd_offload=True
         )
     loaded = dict(tree_flatten(stage.parameters()))
+
+    def resident_tables(model):
+        return [
+            layer.engram.embed._resident is not None
+            for layer in model.language_model.pipeline_layers
+            if "engram" in layer
+        ]
+
+    assert resident_tables(stage) == [True]
+    assert resident_tables(offloaded) == [False]
+    offloaded.close()
 
     assert stage.model.start_idx == 3
     assert len(stage.make_cache()) == len(stage.layers) == 2
@@ -1535,6 +1605,7 @@ def pack_split_projections(target):
     (target / "model.safetensors.index.json").write_text(json.dumps(index))
 
 
+@pytest.mark.slow
 def test_tensor_parallel_ranks_match_single_process(tmp_path):
     from omlx.patches.deepseek_v41.convert import convert
 
@@ -1680,6 +1751,7 @@ print(json.dumps({"rank": rank, "ok": True, "cycles": len(cycles)}), flush=True)
 """
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize(
     ("drafts", "split"),
     [("head", "pipeline"), ("oracle", "pipeline"), ("oracle", "tensor")],

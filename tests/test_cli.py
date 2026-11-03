@@ -8,6 +8,7 @@ Note: Configuration validation tests are in test_config.py.
 
 import argparse
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -36,6 +37,32 @@ class TestCLIModule:
 
         # The module should have the main entry point
         assert callable(cli.main)
+
+    def test_package_import_relaxes_metal_preemption_timeout(self):
+        """Importing omlx sets the Metal driver flag and keeps an explicit value."""
+        code = (
+            "import os, omlx; print(os.environ.get('AGX_RELAX_CDM_CTXSTORE_TIMEOUT'))"
+        )
+        env = {
+            k: v for k, v in os.environ.items() if k != "AGX_RELAX_CDM_CTXSTORE_TIMEOUT"
+        }
+        default = subprocess.run(
+            [sys.executable, "-c", code],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        explicit = subprocess.run(
+            [sys.executable, "-c", code],
+            env={**env, "AGX_RELAX_CDM_CTXSTORE_TIMEOUT": "0"},
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        expected = "1" if sys.platform == "darwin" else "None"
+        assert default.stdout.strip() == expected
+        assert explicit.stdout.strip() == "0"
 
 
 class TestCLIHelp:
@@ -548,7 +575,12 @@ class TestLaunchCommandFunction:
         ctx = integration.launch.call_args.args[0]
         assert ctx.cross_session is True
 
-    def test_launch_command_skips_picker_when_integration_registers_catalog(self):
+    @pytest.mark.parametrize(
+        ("tool", "setting"), [("dsh", "dsh_model"), ("codex_app", "codex_model")]
+    )
+    def test_launch_command_skips_picker_when_integration_registers_catalog(
+        self, tool, setting
+    ):
         """Tools with requires_model_selection=False never prompt.
 
         The model comes from the saved per-tool default (or --model) and
@@ -563,6 +595,7 @@ class TestLaunchCommandFunction:
 
         health_response = MagicMock()
         health_response.raise_for_status.return_value = None
+        health_response.json.return_value = {"default_model": "server-default"}
 
         status_response = MagicMock()
         status_response.ok = True
@@ -572,10 +605,10 @@ class TestLaunchCommandFunction:
         settings.server.host = "127.0.0.1"
         settings.server.port = 8000
         settings.claude_code = None
-        settings.integrations.dsh_model = "Qwen3.8-27B-oQ5e-mtp"
+        setattr(settings.integrations, setting, "Qwen3.8-27B-oQ5e-mtp")
 
         args = argparse.Namespace(
-            tool="dsh",
+            tool=tool,
             host=None,
             port=None,
             api_key="test-key",
@@ -595,6 +628,7 @@ class TestLaunchCommandFunction:
         integration.launch.assert_called_once()
         ctx = integration.launch.call_args.args[0]
         assert ctx.model == "Qwen3.8-27B-oQ5e-mtp"
+        assert ctx.default_model == "server-default"
 
     def test_launch_command_resolves_alias_status_metadata(self):
         """Alias model IDs should keep status metadata from the real model."""
@@ -1140,6 +1174,7 @@ class TestServeCommandFunctions:
             enabled=False,
             ane_compile_cache=False,
             get_ssd_cache_dir=lambda base_path: tmp_path / "cache",
+            is_ssd_cache_dir_unavailable=lambda: False,
             get_ssd_cache_max_size_bytes=lambda base_path: 0,
             get_hot_cache_max_size_bytes=lambda: 0,
         )

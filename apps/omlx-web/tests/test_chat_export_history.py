@@ -12,12 +12,18 @@ import pytest
 CHAT_TEMPLATE = Path(__file__).parents[1] / "omlx_web" / "templates" / "chat.html"
 
 METHODS = [
+    "isTemporaryChat",
+    "toggleTemporaryChat",
+    "discardTemporaryChat",
+    "resetStreamSession",
+    "createThinkingState",
     "messageForStorage",
     "saveCurrentChat",
     "saveChatHistory",
     "sortChatHistory",
     "cloneData",
     "downloadChats",
+    "loadChatHistory",
 ]
 
 
@@ -75,6 +81,9 @@ console.warn = () => {};
         + """
 app.chatHistory = [];
 app.chatSessions = {};
+app.streamSessions = {};
+app.getStreamSession = id => app.streamSessions[id] || null;
+app.cancelStreamTransport = () => {};
 app.currentChatId = 'chat_1';
 app.currentModel = 'model';
 app.systemPrompt = '';
@@ -84,6 +93,7 @@ app.resolveAutoChatTitle = (messages, existing) => existing?.title || 'Untitled'
 app.syncSessionModelSettingsFromUi = () => {};
 app.captureSessionModelSettings = () => ({});
 app.saveModelSettingsForModel = () => {};
+app.resolveGatewayModelId = model => model;
 const exportedChats = async () => {
     exported = null;
     await app.downloadChats();
@@ -128,6 +138,36 @@ console.log(JSON.stringify({
     ]
 
 
+def test_temporary_chat_stays_out_of_history_and_export():
+    """Switching to temporary, saving, and a stream finishing after leaving."""
+    result = _run("""
+app.chatSessions.chat_old = {messages: [], model: 'model', systemPrompt: '',
+                             modelSettingsByModel: {}};
+app.saveCurrentChat('chat_old', [{id: 'o1', role: 'user', content: 'kept'}]);
+const session = {messages: [], model: 'model', systemPrompt: '',
+                 modelSettingsByModel: {}};
+app.chatSessions.chat_1 = session;
+app.messages = session.messages;
+app.saveCurrentChat('chat_1');
+await app.toggleTemporaryChat();
+session.messages.push({id: 'u1', role: 'user', content: 'secret'});
+app.saveCurrentChat('chat_1');
+const stream = {chatId: 'chat_1', isStreaming: true};
+app.streamSessions.chat_1 = stream;
+app.discardTemporaryChat('chat_1');
+app.currentChatId = 'chat_2';
+app.saveCurrentChat('chat_1', session.messages, 'model', '');
+app.resetStreamSession(stream);
+const stored = JSON.parse(localStorage.getItem(CHAT_HISTORY_STORAGE_KEY));
+const chats = await exportedChats();
+console.log(JSON.stringify({stored: stored.map(c => c.id),
+                            exported: chats.map(c => c.id),
+                            sessions: Object.keys(app.chatSessions)}));
+""")
+    assert result == {"stored": ["chat_old"], "exported": ["chat_old"],
+                      "sessions": ["chat_old"]}
+
+
 def test_export_keeps_the_current_chat_when_another_chat_is_pinned():
     """Pinned chats sort first, so the quota trim drops the chat in use."""
     result = _run("""
@@ -160,3 +200,26 @@ console.log(JSON.stringify({chats}));
         ("chat_1", ["first", "re: first", "second", "re: second"]),
         ("chat_old", ["earlier question", "re: earlier question"]),
     ]
+
+
+def test_chat_started_before_history_loads_keeps_saved_chats():
+    """New Chat can save before init() has loaded the history."""
+    result = _run("""
+localStorage.setItem(CHAT_HISTORY_STORAGE_KEY, JSON.stringify([
+    {id: 'chat_a', title: 'A', messages: [], updatedAt: '2026-01-02T00:00:00Z'},
+    {id: 'chat_b', title: 'B', messages: [], updatedAt: '2026-01-01T00:00:00Z'},
+]));
+app.chatHistoryPending = true;
+app.chatSessions.chat_1 = {messages: [], model: 'model', systemPrompt: '',
+                           modelSettingsByModel: {}};
+app.saveCurrentChat('chat_1');
+const ids = () => JSON.parse(localStorage.getItem(CHAT_HISTORY_STORAGE_KEY))
+    .map(c => c.id);
+const beforeLoad = ids();
+app.loadChatHistory();
+console.log(JSON.stringify({beforeLoad, after: ids()}));
+""")
+    assert result == {
+        "beforeLoad": ["chat_a", "chat_b"],
+        "after": ["chat_1", "chat_a", "chat_b"],
+    }

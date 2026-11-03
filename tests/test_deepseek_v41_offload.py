@@ -119,7 +119,8 @@ def test_wide_affine_prefetch_keeps_rows_and_enforces_bound(
     )
     disk = DiskEngramEmbedding(path, "w", "s", bias_key="b", bits=4)
     prefetch = EngramPrefetch()
-    ids = (np.arange(tokens * 24, dtype=np.int64) % 16).reshape(1, tokens, 24)
+    ids = np.random.default_rng(tokens).integers(0, 16, (1, tokens, 24), dtype=np.int64)
+    unique_ids, _ = storage.dedupe_tuple_ids(ids)
     read = disk._read_rows
     threads = []
 
@@ -129,23 +130,81 @@ def test_wide_affine_prefetch_keeps_rows_and_enforces_bound(
 
     monkeypatch.setattr(disk, "_read_rows", observe)
     try:
-        expected = read(ids)
+        expected = read(unique_ids)
         with prefetch.forward():
             prefetch.submit(disk, ids)
             assert (prefetch._pending is not None) is admitted
             if admitted:
                 actual = prefetch._pending[1].result(timeout=10)
-                np.testing.assert_array_equal(disk._prefetched[0], ids)
+                np.testing.assert_array_equal(disk._prefetched[0], unique_ids)
                 assert threads == ["v41-engram_0"]
             else:
                 assert threads == []
-                actual = disk._read_rows(ids)
+                actual = disk._read_rows(unique_ids)
             for (got, got_dtype), (want, want_dtype) in zip(actual, expected):
                 assert got_dtype == want_dtype
                 np.testing.assert_array_equal(got, want)
         assert prefetch._pending is None and disk._prefetched is None
     finally:
         prefetch.close()
+        disk.close()
+
+
+def test_carry_survives_active_drain_and_activates(tmp_path):
+    disk = table(tmp_path)
+    active = EngramPrefetch()
+    carry = EngramPrefetch()
+    current_ids = np.array([[5, 1]])
+    next_ids = np.array([[2, 3]])
+    expected = np.asarray(disk(mx.array(next_ids)).astype(mx.float32))
+    try:
+        assert carry.submit_carry(disk, next_ids)
+        assert disk._prefetched is None
+        with active.forward():
+            active.submit(disk, current_ids)
+            actual = disk(mx.array(current_ids))
+            mx.eval(actual)
+        assert active._pending is None
+        assert disk._prefetched is None
+        assert carry.has_pending()
+        assert disk._prefetched is None
+        assert carry.activate()
+        assert np.array_equal(disk._prefetched[0], next_ids)
+        with carry.forward():
+            actual = disk(mx.array(next_ids))
+            mx.eval(actual)
+        np.testing.assert_array_equal(actual.astype(mx.float32), expected)
+        assert carry._pending is None and disk._prefetched is None
+    finally:
+        active.close()
+        carry.close()
+        disk.close()
+
+
+def test_activated_carry_is_not_read_again(tmp_path, monkeypatch):
+    disk = table(tmp_path)
+    carry = EngramPrefetch()
+    ids = np.array([[5, 1, 5, 0]])
+    calls = []
+    original = disk._read_rows
+
+    def read(rows):
+        calls.append(1)
+        return original(rows)
+
+    monkeypatch.setattr(disk, "_read_rows", read)
+    try:
+        assert carry.submit_carry(disk, ids)
+        assert len(calls) == 1
+        carry.activate()
+        with carry.forward():
+            carry.submit(disk, ids)
+            actual = disk(mx.array(ids))
+            mx.eval(actual)
+        assert len(calls) == 1
+        assert carry._pending is None and disk._prefetched is None
+    finally:
+        carry.close()
         disk.close()
 
 
@@ -210,8 +269,62 @@ def test_converted_modes_match_chunked_prefill_decode_and_cleanup(converted):
             if "engram" in layer:
                 assert layer.engram.embed._weights._mapping is None
         assert disk.language_model._engram_prefetch._closed
+        assert disk.language_model._engram_next_prefetch._closed
     finally:
         resident.close()
+        disk.close()
+
+
+def test_engram_next_chunk_carry_activates_across_chunks(converted, monkeypatch):
+    disk, _ = load(converted, engram_ssd_offload=True)
+    language = disk.language_model
+    cache = language.make_cache()
+    first_embed = language.layers[1].engram.embed
+    table_reads = []
+    original = first_embed._read_rows
+
+    def read(rows):
+        table_reads.append(1)
+        return original(rows)
+
+    monkeypatch.setattr(first_embed, "_read_rows", read)
+    empty = mx.zeros((1, 0), dtype=mx.int32)
+    chunk1 = mx.array([[3, 4, 5]], dtype=mx.int32)
+    chunk2 = mx.array([[6, 7]], dtype=mx.int32)
+    chunk3 = mx.array([[8, 9]], dtype=mx.int32)
+    try:
+        # First chunk starts before the loop reaches it.
+        language.prefetch_engram(chunk1, empty, cache=cache)
+        assert language._engram_prefetch.has_pending()
+        assert not language._engram_next_prefetch.has_pending()
+        # While chunk 1 runs, gather chunk 2's first table.
+        language.prefetch_engram(chunk2, chunk1, cache=cache)
+        assert language._engram_prefetch.has_pending()
+        assert language._engram_next_prefetch.has_pending()
+        out = disk(chunk1, cache=cache)
+        mx.eval(out)
+        assert len(table_reads) == 2
+        assert language._engram_prefetch._pending is None
+        assert language._engram_next_prefetch.has_pending()
+        # Chunk 2 activates the carry and starts chunk 3 during its GPU work.
+        language.prefetch_engram(chunk3, chunk2, cache=cache)
+        assert language._engram_prefetch.has_pending()
+        assert language._engram_next_prefetch.has_pending()
+        out = disk(chunk2, cache=cache)
+        mx.eval(out)
+        assert len(table_reads) == 3
+        assert language._engram_prefetch._pending is None
+        assert language._engram_next_prefetch.has_pending()
+        # The final chunk activates the last carry even with no next chunk.
+        language.prefetch_engram(empty, chunk3, cache=cache)
+        assert language._engram_prefetch.has_pending()
+        assert not language._engram_next_prefetch.has_pending()
+        out = disk(chunk3, cache=cache)
+        mx.eval(out)
+        assert len(table_reads) == 3
+        assert language._engram_prefetch._pending is None
+        assert not language._engram_next_prefetch.has_pending()
+    finally:
         disk.close()
 
 
@@ -787,6 +900,91 @@ def test_decode_rows_prefetch_their_pages(tmp_path, monkeypatch):
         actual, _ = reader.read("w", ids)
         np.testing.assert_array_equal(actual, raw[ids])
         assert calls
+    finally:
+        reader.close()
+
+
+def test_wide_mixed_reads_only_read_rows_on_new_pages(tmp_path, monkeypatch):
+    path = tmp_path / "mixed.safetensors"
+    row_bytes = 519
+    raw = np.random.default_rng(19).integers(0, 256, (4096, row_bytes), dtype=np.uint8)
+    raw_safetensors(path, {"w": (raw, "U8")})
+    reader = storage.TensorFile(path)
+    original = storage.os.pread
+    calls = []
+
+    def counted(fd, count, offset):
+        calls.append((offset, offset + count))
+        return original(fd, count, offset)
+
+    try:
+        reader.read("w", np.arange(24))
+        # This row starts on the warm first page and ends on a new page.
+        crossing = (storage.PAGE_SIZE - reader._start) // row_bytes
+        offset = reader._start + crossing * row_bytes
+        assert offset < storage.PAGE_SIZE < offset + row_bytes
+        monkeypatch.setattr(storage.os, "pread", counted)
+        rows = np.tile([0, crossing, 2, 15], 5000).reshape(4, -1)
+        actual, _ = reader.read("w", rows)
+        np.testing.assert_array_equal(actual, raw[rows])
+        assert calls == [(offset, offset + row_bytes)]
+        # Narrow mixed reads, such as decode, still read every row.
+        calls.clear()
+        narrow = np.array([2, 3000, 15])
+        actual, _ = reader.read("w", narrow)
+        np.testing.assert_array_equal(actual, raw[narrow])
+        for row in narrow:
+            begin = reader._start + int(row) * row_bytes
+            assert any(
+                low <= begin and begin + row_bytes <= high for low, high in calls
+            )
+    finally:
+        reader.close()
+
+
+def test_evicted_warm_pages_keep_only_that_tensor_on_reads(tmp_path, monkeypatch):
+    path = tmp_path / "evicted.safetensors"
+    weights = np.arange(8192 * 64, dtype=np.uint8).reshape(8192, 64)
+    scales = np.arange(8192, dtype=np.float16).reshape(8192, 1)
+    raw_safetensors(path, {"w": (weights, "U8"), "s": (scales, "F16")})
+    reader = storage.TensorFile(path)
+    rows = np.tile([0, 255, 256, 4095], 4096)
+    address = np.frombuffer(reader._mapping, dtype=np.uint8, count=1).ctypes.data
+    first_scale_page = (reader._start + weights.nbytes) // storage.PAGE_SIZE
+    scale_page = address + first_scale_page * storage.PAGE_SIZE
+    original = storage.os.pread
+    calls = []
+    clock = [100.0]
+    weights_cached = [False]
+
+    def counted(fd, count, offset):
+        calls.append(offset)
+        return original(fd, count, offset)
+
+    def mincore(page, length, state):
+        state._obj.value = int(weights_cached[0] or page >= scale_page)
+        return 0
+
+    monkeypatch.setattr(storage.os, "pread", counted)
+    monkeypatch.setattr(storage, "_MINCORE", mincore)
+    monkeypatch.setattr(storage.time, "monotonic", lambda: clock[0])
+    try:
+        for key, raw in (("w", weights), ("s", scales)):
+            np.testing.assert_array_equal(reader.read(key, rows)[0], raw[rows])
+        calls.clear()
+        np.testing.assert_array_equal(reader.read("w", rows)[0], weights[rows])
+        assert calls
+        calls.clear()
+        np.testing.assert_array_equal(reader.read("s", rows)[0], scales[rows])
+        assert not calls
+        # The weight fallback holds without a new probe until it expires.
+        weights_cached[0] = True
+        reader.read("w", rows)
+        assert calls
+        calls.clear()
+        clock[0] += storage.ROW_READ_RETRY_SECONDS
+        np.testing.assert_array_equal(reader.read("w", rows)[0], weights[rows])
+        assert not calls
     finally:
         reader.close()
 

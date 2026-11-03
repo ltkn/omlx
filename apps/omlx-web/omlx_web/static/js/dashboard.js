@@ -49,8 +49,8 @@
         'qwen35_ane_prefill_cpu_shared_resource',
         'moe_expert_offload_enabled',
         'moe_expert_offload_resident_fraction',
-        'qwen35_oq_a8_enabled',
-        'qwen35_oq_a8_min_tokens',
+        'a8_prefill_enabled',
+        'a8_prefill_min_tokens',
         'specprefill_enabled',
         'specprefill_draft_model',
         'specprefill_keep_pct',
@@ -165,7 +165,7 @@
                 model: { model_dirs: [''], model_fallback: false, hide_helper_models: false },
                 memory: { prefill_memory_guard: true, memory_guard_tier: 'balanced', memory_guard_custom_ceiling_gb: 0 },
                 scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false, prefill_priority: 'context', decode_fairness: true },
-                cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', hot_cache_write_through: false, ane_compile_cache: false, initial_cache_blocks: 256, hot_cache_only: false, gdn_snapshot_storage: 'auto', gdn_ssd_split_enabled: true, gdn_ssd_pending_max_size: '512MB', gdn_sidecar_precision: 'fp32' },
+                cache: { enabled: true, ssd_cache_dir: '', ssd_cache_unavailable: false, ssd_cache_max_size: 'auto', hot_cache_max_size: '0', hot_cache_write_through: false, ane_compile_cache: false, initial_cache_blocks: 256, hot_cache_only: false, gdn_snapshot_storage: 'auto', gdn_ssd_split_enabled: true, gdn_ssd_pending_max_size: '512MB', gdn_sidecar_precision: 'fp32' },
                 sampling: { max_context_window: 32768, max_context_window_policy: null, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
                 mcp: { config_path: '', expose_tools: true },
                 usage: { usage_history: true },
@@ -263,6 +263,8 @@
             // Model settings modal
             showModelSettingsModal: false,
             selectedModel: null,
+            moeOffloadFit: null,
+            moeOffloadFitUrl: null,
             modelSettings: {
                 model_alias: '',
                 model_type_override: '',
@@ -297,8 +299,8 @@
                 qwen35_ane_prefill_cpu_shared_resource: true,
                 moe_expert_offload_enabled: false,
                 moe_expert_offload_resident_fraction: 0.25,
-                qwen35_oq_a8_enabled: false,
-                qwen35_oq_a8_min_tokens: 128,
+                a8_prefill_enabled: false,
+                a8_prefill_min_tokens: 128,
                 external_engine: '',
                 external_engines: [],
                 model_format: null,
@@ -382,6 +384,7 @@
                 runtime_cache: {
                     base_path: '',
                     ssd_cache_dir: '',
+                    ssd_cache_unavailable: false,
                     response_state_dir: '',
                     models: [],
                     total_num_files: 0,
@@ -486,6 +489,10 @@
             hfTokenInvalid: false,
             _hfRefreshTimer: null,
             hfDeleteConfirm: null,
+            // Lowercased repo ID -> {files, size} from the last update check.
+            hfUpdates: {},
+            hfUpdatesChecking: false,
+            hfUpdatesStatus: '',
 
             // Recommended models state
             hfRecommended: { trending: [], popular: [] },
@@ -1724,6 +1731,12 @@
                         }
                         continue;
                     }
+                    if (k === 'gpu_power_limit_w') {
+                        if (ms.enableGpuPowerLimit && ms.gpu_power_limit_w) {
+                            out.gpu_power_limit_w = Number(ms.gpu_power_limit_w);
+                        }
+                        continue;
+                    }
                     if (k === 'guided_grammar_enabled') {
                         out.guided_grammar_enabled = !!ms.guided_grammar_enabled;
                         continue;
@@ -2149,6 +2162,8 @@
                         String(model?.config_model_type || '').toLowerCase().replaceAll('-', '_') === 'deepseek_v41',
                     qwen4_gdn_decode_wide_proj:
                         s.qwen4_gdn_decode_wide_proj === true,
+                    activation_fp16_enabled: s.activation_fp16_enabled === true,
+                    activation_fp16_supported: model?.activation_fp16_supported === true,
                     qwen4_gdn_decode_wide_proj_supported:
                         String(model?.config_model_type || '').toLowerCase().replaceAll('-', '_') === 'qwen4_exp',
                     deepseek_v41_engram_ssd_offload: model?.deepseek_v41_engram_ssd_offload_forced === true
@@ -2161,6 +2176,9 @@
                         model?.deepseek_v41_engram_ssd_offload_forced === true,
                     enableThinkingBudget: !!(s.thinking_budget_tokens),
                     thinking_budget_tokens: s.thinking_budget_tokens || null,
+                    enableGpuPowerLimit: !!(s.gpu_power_limit_w),
+                    gpu_power_limit_w: s.gpu_power_limit_w || null,
+                    gpu_power_limit_supported: model?.gpu_power_limit_supported === true,
                     guided_grammar_enabled: s.guided_grammar_enabled || false,
                     guided_grammar: s.guided_grammar || '',
                     enableToolResultLimit: !!(s.max_tool_result_tokens),
@@ -2180,8 +2198,8 @@
                     moe_expert_offload_resident_percent: Number(((s.moe_expert_offload_resident_fraction ?? 0.25) * 100).toPrecision(15)),
                     moe_expert_offload_resident_touched: false,
                     moe_offload_allows_mtp: model?.moe_offload_allows_mtp === true,
-                    qwen35_oq_a8_enabled: s.qwen35_oq_a8_enabled || false,
-                    qwen35_oq_a8_min_tokens: s.qwen35_oq_a8_min_tokens ?? 128,
+                    a8_prefill_enabled: s.a8_prefill_enabled || false,
+                    a8_prefill_min_tokens: s.a8_prefill_min_tokens ?? 128,
                     qwen35_ane_prefill_enabled: s.qwen35_ane_prefill_enabled || false,
                     qwen35_ane_prefill_sequence_length: s.qwen35_ane_prefill_sequence_length || 2048,
                     qwen35_ane_prefill_tail_padding_min_tokens: s.qwen35_ane_prefill_tail_padding_min_tokens ?? 0,
@@ -2259,6 +2277,41 @@
                 this.onMoeExpertOffloadResidentPercent();
             },
 
+            loadMoeOffloadFit() {
+                // Sized from the unsaved edits that change the estimate; refetch only when they change.
+                const model = this.selectedModel;
+                if (model?.moe_expert_offload_supported !== true) return;
+                const payload = this.buildModelSettingsPayload(this.modelSettings);
+                const params = new URLSearchParams();
+                for (const key of ['mtp_enabled', 'qwen4_ple_ssd_offload', 'deepseek_v41_engram_ssd_offload']) {
+                    params.set(key, String(!!payload[key]));
+                }
+                const url = `/admin/api/models/${encodeURIComponent(model.id)}/moe-offload-fit?${params}`;
+                if (url === this.moeOffloadFitUrl) return;
+                this.moeOffloadFitUrl = url;
+                this.moeOffloadFit = null;
+                return fetch(url).then(async resp => {
+                    if (!resp.ok) return;
+                    const fit = await resp.json();
+                    if (this.moeOffloadFitUrl === url) this.moeOffloadFit = fit;
+                }).catch(() => { /* network error */ });
+            },
+
+            moeOffloadFitText() {
+                const fit = this.moeOffloadFit;
+                const key = fit?.status === 'fit' ? 'moe_expert_offload_fit' : 'moe_expert_offload_no_fit';
+                return window.t(`modal.model_settings.${key}`)
+                    .replace('{percent}', fit?.max_percent)
+                    .replace('{size}', this.formatByteCount(fit?.bytes))
+                    .replace('{reserve}', this.formatByteCount(fit?.reserve_bytes));
+            },
+
+            applyMoeOffloadFit() {
+                if (this.moeOffloadFit?.status !== 'fit') return;
+                this.modelSettings.moe_expert_offload_resident_percent = this.moeOffloadFit.max_percent;
+                this.onMoeExpertOffloadResidentPercent();
+            },
+
             onMoeExpertOffloadResidentPercent() {
                 // Defer clamping until blur so partial input remains editable.
                 this.modelSettings.moe_expert_offload_resident_touched = true;
@@ -2289,6 +2342,8 @@
                 ms.enable_thinking = null;
                 ms.enableThinkingBudget = false;
                 ms.thinking_budget_tokens = null;
+                ms.enableGpuPowerLimit = false;
+                ms.gpu_power_limit_w = null;
                 ms.enableToolResultLimit = false;
                 ms.max_tool_result_tokens = null;
                 ms.ctKwargEntries = [];
@@ -2312,6 +2367,10 @@
                     } else if (k === 'max_tool_result_tokens') {
                         ms.enableToolResultLimit = s[k] != null;
                         ms.max_tool_result_tokens = s[k] ?? null;
+                    } else if (k === 'gpu_power_limit_w') {
+                        // Profiles may store 0 for "off".
+                        ms.enableGpuPowerLimit = s[k] > 0;
+                        ms.gpu_power_limit_w = s[k] > 0 ? s[k] : null;
                     } else if (k === 'guided_grammar_enabled') {
                         ms.guided_grammar_enabled = !!s[k];
                     } else if (k === 'guided_grammar') {
@@ -2959,6 +3018,8 @@
                     || this.selectedModel?.id !== model.id
                     || JSON.stringify(this.modelSettings) !== baseline)) return;
                 this.selectedModel = model;
+                // A fresh open re-sizes; a focus refresh keeps the current hint.
+                if (!preservingEdits) this.moeOffloadFitUrl = null;
                 this.modelSettings = this.buildModelSettingsState(
                     model,
                     model.settings || {},
@@ -3009,31 +3070,40 @@
                 return null;
             },
 
-            isQwenOqA8Model(model) {
+            isA8PrefillModel(model) {
                 const type = String(model?.config_model_type || '').toLowerCase().replaceAll('-', '_');
-                // qwen4_exp (Qwen3.8-Flash-Next) is an exact match: only that
-                // validated family has routed-expert A8, not every qwen4*.
-                return type === 'qwen4_exp'
+                // qwen4_exp (Qwen3.8-Flash-Next) and deepseek_v41 are exact
+                // matches: only those validated families have routed-expert A8.
+                return type === 'qwen4_exp' || type === 'deepseek_v41'
                     || ['qwen3_5', 'qwen3_6', 'qwen3_8'].some(prefix => type.startsWith(prefix));
             },
 
             // The kernels need native INT8 tensor ops (M5-series or newer).
             // A saved "on" keeps the toggle so it can be turned off.
-            showsQwenOqA8(model) {
-                return this.isQwenOqA8Model(model)
-                    && (model?.qwen35_oq_a8_supported === true
-                        || model?.settings?.qwen35_oq_a8_enabled === true);
+            showsA8Prefill(model) {
+                return this.isA8PrefillModel(model)
+                    && (model?.a8_prefill_supported === true
+                        || model?.settings?.a8_prefill_enabled === true);
             },
 
-            validateQwenOqA8Settings() {
-                if (!this.modelSettings.qwen35_oq_a8_enabled) return null;
+            validateGpuPowerLimit() {
+                if (!this.modelSettings.enableGpuPowerLimit) return null;
+                const watts = Number(this.modelSettings.gpu_power_limit_w);
+                if (!Number.isInteger(watts) || watts < 2 || watts > 1000) {
+                    return window.t('js.error.gpu_power_limit_range');
+                }
+                return null;
+            },
+
+            validateA8PrefillSettings() {
+                if (!this.modelSettings.a8_prefill_enabled) return null;
                 // Both wrap the same MLP call, so the combination silently
                 // disables one of them. Caught here so the modal explains it
                 // instead of surfacing the server's 400.
                 if (this.modelSettings.qwen35_ane_prefill_enabled) {
                     return window.t('js.error.ane_oq_a8_conflict');
                 }
-                const minTokens = Number(this.modelSettings.qwen35_oq_a8_min_tokens);
+                const minTokens = Number(this.modelSettings.a8_prefill_min_tokens);
                 if (!Number.isInteger(minTokens) || minTokens < 1) {
                     return window.t('js.error.oq_a8_min_tokens_positive');
                 }
@@ -3173,6 +3243,7 @@
                         !!ms.deepseek_v41_ced_prefill_enabled,
                     qwen4_gdn_decode_wide_proj:
                         !!ms.qwen4_gdn_decode_wide_proj,
+                    activation_fp16_enabled: !!ms.activation_fp16_enabled,
                     deepseek_v41_engram_ssd_offload:
                         ms.deepseek_v41_engram_ssd_offload_forced
                             ? !!ms.deepseek_v41_engram_ssd_offload_requested
@@ -3180,6 +3251,9 @@
                     thinking_budget_enabled: ms.enableThinkingBudget,
                     thinking_budget_tokens: ms.enableThinkingBudget
                         ? (ms.thinking_budget_tokens || null)
+                        : 0,
+                    gpu_power_limit_w: ms.enableGpuPowerLimit
+                        ? (Number(ms.gpu_power_limit_w) || 0)
                         : 0,
                     guided_grammar_enabled: ms.guided_grammar_enabled,
                     guided_grammar: ms.guided_grammar_enabled
@@ -3201,8 +3275,8 @@
                         : 4,
                     moe_expert_offload_enabled: !isDiffusion && this.selectedModel?.moe_expert_offload_supported === true && !!ms.moe_expert_offload_enabled,
                     moe_expert_offload_resident_fraction: ms.moe_expert_offload_resident_fraction ?? 0.25,
-                    qwen35_oq_a8_enabled: !!ms.qwen35_oq_a8_enabled,
-                    qwen35_oq_a8_min_tokens: Number(ms.qwen35_oq_a8_min_tokens) || 128,
+                    a8_prefill_enabled: !!ms.a8_prefill_enabled,
+                    a8_prefill_min_tokens: Number(ms.a8_prefill_min_tokens) || 128,
                     qwen35_ane_prefill_enabled: !!ms.qwen35_ane_prefill_enabled,
                     // Validation only runs when the feature is enabled, so a
                     // blank numeric input must fall back to the server default
@@ -3346,15 +3420,21 @@
             async saveModelSettings() {
                 if (!this.selectedModel) return;
 
-                const qwenOqA8ValidationError = this.validateQwenOqA8Settings();
-                if (qwenOqA8ValidationError) {
-                    alert(qwenOqA8ValidationError);
+                const a8PrefillValidationError = this.validateA8PrefillSettings();
+                if (a8PrefillValidationError) {
+                    alert(a8PrefillValidationError);
                     return;
                 }
 
                 const qwenAneValidationError = this.validateQwenAneSettings();
                 if (qwenAneValidationError) {
                     alert(qwenAneValidationError);
+                    return;
+                }
+
+                const gpuPowerLimitError = this.validateGpuPowerLimit();
+                if (gpuPowerLimitError) {
+                    alert(gpuPowerLimitError);
                     return;
                 }
 
@@ -3400,7 +3480,8 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        alert(data.detail || window.t('js.error.save_model_settings_failed'));
+                        // Request validation errors (422) carry a list of objects.
+                        alert(Array.isArray(data.detail) ? data.detail.map(e => (e && typeof e === 'object') ? (e.msg || JSON.stringify(e)) : String(e)).join(', ') : (data.detail || window.t('js.error.save_model_settings_failed')));
                     }
                 } catch (err) {
                     console.error('Failed to save model settings:', err);
@@ -3594,6 +3675,8 @@
                         this.modelSettings.enable_thinking = false;
                         this.modelSettings.enableThinkingBudget = false;
                         this.modelSettings.thinking_budget_tokens = 0;
+                        this.modelSettings.enableGpuPowerLimit = false;
+                        this.modelSettings.gpu_power_limit_w = null;
                         this.modelSettings.enableToolResultLimit = false;
                         this.modelSettings.max_tool_result_tokens = 0;
                         this.modelSettings.ctKwargEntries = [];
@@ -4568,11 +4651,15 @@
             async clearSsdCache() {
                 try {
                     const resp = await fetch('/admin/api/ssd-cache/clear', { method: 'POST' });
-                    if (!resp.ok) console.error('SSD cache clear failed:', resp.status);
+                    if (!resp.ok) {
+                        const data = await resp.json();
+                        throw new Error(data.detail || window.t('js.error.clear_ssd_cache_failed'));
+                    }
                     this.showClearSsdCacheConfirm = false;
                     await this.loadStats();
                 } catch (err) {
                     console.error('Failed to clear SSD cache:', err);
+                    alert(err.message || window.t('js.error.clear_ssd_cache_failed'));
                     this.showClearSsdCacheConfirm = false;
                 }
             },
@@ -5262,6 +5349,12 @@
                 if (capped === 'target') return window.t('ctx_bench.capped.target');
                 if (capped === 'native') return window.t('ctx_bench.capped.native');
                 return window.t('ctx_bench.capped.memory');
+            },
+
+            // A model's GPU power limit; benchmarks always run without it.
+            benchGpuPowerLimit(modelId) {
+                const m = this.models.find(m => m.id === modelId);
+                return m?.settings?.gpu_power_limit_w || 0;
             },
 
             // Native context length of the selected bench model (0 = unknown).
@@ -7099,6 +7192,8 @@
                     });
 
                     if (response.ok) {
+                        const { [repoId.toLowerCase()]: _done, ...updates } = this.hfUpdates;
+                        this.hfUpdates = updates;
                         this.hfSuccess = window.t('js.success.download_started').replace('{repo_id}', repoId);
                         if (this.hfRepoId.trim().toLowerCase() === repoId.toLowerCase()) this.hfRepoId = '';
                         this.closeModelDetail();
@@ -7163,6 +7258,61 @@
                     }
                 } catch (err) {
                     console.error('Failed to load HF models:', err);
+                }
+            },
+
+            // Folders the downloader writes, which an update check can compare.
+            get hfUpdateRepoIds() {
+                return this.hfModels
+                    .filter(m => m.repo_id && m.source_type === 'local')
+                    .map(m => m.repo_id);
+            },
+
+            hfUpdateFor(model) {
+                if (!model.repo_id || !this.isModelDownloaded(model.repo_id)) return null;
+                return this.hfUpdates[model.repo_id.toLowerCase()];
+            },
+
+            async checkHFUpdates() {
+                this.hfUpdatesChecking = true;
+                this.hfUpdatesStatus = '';
+                try {
+                    const response = await fetch('/admin/api/hf/updates', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ repo_ids: this.hfUpdateRepoIds, hf_token: this.hfToken }),
+                    });
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+                    const data = response.ok ? await response.json() : null;
+                    if (!data || (data.checked && data.failed.length === data.checked)) {
+                        this.hfUpdatesStatus = window.t('models.manager.update_check_failed');
+                        return;
+                    }
+                    if (!data.checked) {
+                        this.hfUpdatesStatus = window.t('models.manager.nothing_to_check');
+                        return;
+                    }
+                    const updates = {};
+                    for (const [repoId, info] of Object.entries(data.updates)) {
+                        updates[repoId.toLowerCase()] = info;
+                    }
+                    this.hfUpdates = updates;
+                    const count = Object.keys(updates).length;
+                    const status = [count
+                        ? window.t('models.manager.updates_found').replace('{count}', count)
+                        : window.t('models.manager.no_updates')];
+                    if (data.failed.length) {
+                        status.push(window.t('models.manager.update_check_partial').replace('{count}', data.failed.length));
+                    }
+                    this.hfUpdatesStatus = status.join(' · ');
+                } catch (err) {
+                    this.hfUpdatesStatus = window.t('models.manager.update_check_failed');
+                    console.error('Failed to check for model updates:', err);
+                } finally {
+                    this.hfUpdatesChecking = false;
                 }
             },
 
@@ -7744,27 +7894,14 @@
                 }
             },
 
-            // A GGUF model file: at the repo root or split in its VARIANT/ folder.
-            isGgufModelFile(name) {
-                const lower = name.toLowerCase();
-                if (!lower.endsWith('.gguf') || lower.includes('mmproj')) return false;
-                const [folder, base, ...rest] = lower.split('/');
-                if (base === undefined) return true;
-                const split = base.match(/^(.+)-\d{5}-of-\d{5}\.gguf$/);
-                return !rest.length && !folder.startsWith('.') && !!split
-                    && split[1].endsWith(`-${folder}`);
-            },
-
             // The GGUF model files a task fetches, shown beside its repo.
             taskGgufFiles(task) {
-                return (task.files || []).filter(name => this.isGgufModelFile(name)).join(', ');
+                return (task.gguf_files || []).join(', ');
             },
 
-            // The model ID a finished download serves under: a GGUF's file name.
+            // The model ID a finished download serves under.
             taskModelId(task) {
-                const name = (task.files || []).find(f => this.isGgufModelFile(f));
-                if (!name) return task.repo_id.split('/').pop();
-                return name.split('/').pop().replace(/(-\d{5}-of-\d{5})?\.gguf$/i, '');
+                return task.gguf_model_id || task.repo_id.split('/').pop();
             },
 
             // Every download picks its files in the detail modal first.
@@ -8286,11 +8423,11 @@
                 this.msModelDetailLoading = false;
             },
 
-            // A selection starts from what "download all" fetches; GGUF repos start empty.
+            // A selection starts from what "download all" fetches (nothing for GGUF repos) and changed local files.
             resetHfSelection() {
                 const picked = {};
                 for (const file of this.hfModelDetail?.files || []) {
-                    if (file.preselected && !file.local) picked[file.name] = true;
+                    if ((file.preselected || file.outdated) && !file.local) picked[file.name] = true;
                 }
                 this.hfSelectedFiles = picked;
             },
@@ -8324,6 +8461,20 @@
                     .map(file => file.name);
             },
 
+            // A downloaded checkpoint with Hub changes offers Update instead of the download buttons.
+            hfShowsUpdate() {
+                const detail = this.hfModelDetail;
+                return !!(detail && !detail.is_adapter && !detail.unsupported_reason && detail.layout !== 'gguf'
+                    && detail.update_files?.length && this.isModelDownloaded(detail.repo_id));
+            },
+
+            hfUpdateSize() {
+                const names = new Set(this.hfModelDetail?.update_files || []);
+                return (this.hfModelDetail?.files || [])
+                    .filter(file => names.has(file.name))
+                    .reduce((total, file) => total + (file.size || 0), 0);
+            },
+
             hfSelectionSize() {
                 return (this.hfModelDetail?.files || [])
                     .filter(file => this.isHfFileSelected(file))
@@ -8340,12 +8491,7 @@
 
             // What "download all" still has to fetch: its files not downloaded yet.
             hfDownloadAllSize() {
-                const detail = this.hfModelDetail;
-                if (!detail?.files?.length) return detail?.download_all_size || 0;
-                const fetched = detail.layout === 'safetensors' ? (f => f.preselected) : (() => true);
-                return detail.files
-                    .filter(f => fetched(f) && !f.local)
-                    .reduce((total, f) => total + (f.size || 0), 0);
+                return this.hfModelDetail?.download_all_size || 0;
             },
 
             hfFitsDisk(bytes) {
