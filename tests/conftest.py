@@ -8,6 +8,12 @@ import zlib
 # the fp32 parity tests assert 2e-5, which TF32 cannot hold. Test session only.
 os.environ.setdefault("MLX_ENABLE_TF32", "0")
 
+# A machine running an oMLX server usually exports OMLX_API_KEY, and
+# settings.py lets that override beat any settings file or CLI value. Tests
+# that assert what a written file decides would otherwise read the real key, so
+# the ambient value goes before collection; tests that need a key set one.
+os.environ.pop("OMLX_API_KEY", None)
+
 # SPDX-License-Identifier: Apache-2.0
 """
 Pytest configuration and fixtures for oMLX tests.
