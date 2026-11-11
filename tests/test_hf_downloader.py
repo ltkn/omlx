@@ -4282,7 +4282,10 @@ class TestDownloadSpeed:
             side_effect=self._growing_activity(),
         ):
             poll = start_poll(monkeypatch, downloader, task, model_dir)
-            await asyncio.sleep(0.05)
+            # A loaded runner can stretch the 10 ms ticks; ETA warmup is 10 s.
+            deadline = time.monotonic() + 2.0
+            while task.speed_bps == 0 and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
             observed_speed = task.speed_bps
             observed_eta = task.eta_seconds()
             task.status = DownloadStatus.COMPLETED
@@ -5356,6 +5359,19 @@ class TestFileSelection:
         assert part["group"] == "BF16/Q-BF16"
         assert part["mmproj"] == "mmproj-BF16.gguf"
         assert not any(row["required"] for row in gguf)
+
+    def test_ming_campplus_weights_are_required(self):
+        names = [
+            "config.json",
+            "model.safetensors",
+            "campplus.onnx",
+            "campplus.safetensors",
+            "onnx/model.onnx",
+        ]
+        files = [{"name": name, "size": 1} for name in names]
+        hf_downloader_mod._describe_repo_files(files, None)
+        required = {row["name"] for row in files if row["required"]}
+        assert required == set(names) - {"onnx/model.onnx"}
 
     def test_multi_precision_repo_locks_only_the_default_checkpoint(self):
         names = [

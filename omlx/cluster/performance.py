@@ -178,6 +178,11 @@ class ExecutionSettings:
     mtp: bool = False
     mtp_depth: int = 0
     mtp_fixed_depth: bool = False
+    # The model's DeepSeek V4.1 prefill paths. Tensor-parallel ranks load with
+    # them; pipeline stages keep the plain prefill.
+    ced_prefill: bool = False
+    a8_prefill: bool = False
+    a8_prefill_min_tokens: int = 128
 
     def __post_init__(self) -> None:
         if self.profile not in {"interactive", "balanced", "throughput"}:
@@ -190,6 +195,7 @@ class ExecutionSettings:
             "pipeline_microbatch_size",
             "ring_connections_per_ip",
             "prompt_cache_ssd_max_bytes",
+            "a8_prefill_min_tokens",
         ):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
@@ -243,6 +249,9 @@ class ExecutionSettings:
             "mtp": self.mtp,
             "mtp_depth": self.mtp_depth,
             "mtp_fixed_depth": self.mtp_fixed_depth,
+            "ced_prefill": self.ced_prefill,
+            "a8_prefill": self.a8_prefill,
+            "a8_prefill_min_tokens": self.a8_prefill_min_tokens,
         }
 
     @classmethod
@@ -320,28 +329,23 @@ def tune_execution_settings(
 ) -> ExecutionSettings:
     """Bound concurrency while keeping distributed prompt caches coherent.
 
-    MLX-LM's prompt cache evicts independently on every rank. A byte limit is
-    therefore unsafe for unequal pipeline stages: the same prompt occupies
-    different bytes on each Mac, so one rank can retain a prefix another rank
-    evicts. The next request then starts at different token offsets and blocks
-    forever in the first unmatched collective.
+    MLX-LM's prompt cache evicts independently on every rank. A byte limit
+    crosses its threshold at different requests on unequal pipeline stages, so
+    the ranks keep different prefixes and every lookup that disagrees falls
+    back to a full prefill on all ranks. Byte-based eviction therefore stays
+    disabled, even when the user turns off the other automatic tuning.
 
-    Keep exactly one shared conversation prefix and disable byte-based
-    eviction. The sequence-count policy is deterministic across ranks and one
-    slot still accelerates the common follow-up-chat path. This correctness
-    invariant applies even when the user disables the other automatic tuning.
+    Count-based eviction follows request order, which is the same on every
+    rank. Agent traffic needs several entries, or a title or sub-agent request
+    evicts the conversation prefix, so headroom caps the count.
     """
 
-    synchronized_cache = {
-        "prompt_cache_size": 1,
-        "prompt_cache_bytes": None,
-    }
     if not settings.auto_tune or not assignments:
         return replace(
             settings,
-            **synchronized_cache,
+            prompt_cache_bytes=None,
             tuning_reason=(
-                f"{settings.tuning_reason}; synchronized single-prefix cache"
+                f"{settings.tuning_reason}; prompt cache byte budget disabled"
             ),
         )
     minimum_headroom = min(
@@ -376,13 +380,14 @@ def tune_execution_settings(
         decode_concurrency=decode,
         prompt_concurrency=prompt,
         prefill_step_size=prefill,
-        **synchronized_cache,
+        prompt_cache_size=min(settings.prompt_cache_size, caps[3]),
+        prompt_cache_bytes=None,
         pipeline_microbatch_size=microbatch,
         ring_connections_per_ip=connections,
         tuning_reason=(
             f"{settings.profile} profile auto-tuned for {tier}; "
             f"minimum stage headroom {minimum_headroom / _GIB:.2f} GiB; "
-            "synchronized single-prefix cache"
+            "prompt cache byte budget disabled"
         ),
     )
 

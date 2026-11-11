@@ -32,7 +32,7 @@ from .model_profiles import (
 logger = logging.getLogger(__name__)
 
 # Current settings file format version
-SETTINGS_VERSION = 1
+SETTINGS_VERSION = 2
 
 # The Lightning MTP runtime clamps deeper requests to this global ceiling.
 # Keep API validation and runtime normalization on the same contract.
@@ -199,8 +199,43 @@ def resolve_qwen35_prefill_conflicts(data: dict) -> tuple:
     if not (data.get("a8_prefill_enabled") and data.get("qwen35_ane_prefill_enabled")):
         return data, []
     resolved = dict(data)
-    resolved["a8_prefill_enabled"] = False
+    resolved.pop("a8_prefill_enabled")
     return resolved, ["qwen35_ane_prefill_enabled"]
+
+
+def _setting(settings: Any, name: str) -> Any:
+    if settings is None:
+        return None
+    if isinstance(settings, dict):
+        return settings.get(name)
+    return getattr(settings, name, None)
+
+
+def a8_prefill_on(settings: Any) -> bool:
+    """A8 prefill only when it was saved on: it changes numerics."""
+    return bool(_setting(settings, "a8_prefill_enabled"))
+
+
+_A8_EXACT_MODEL_TYPES = ("qwen4_exp", "deepseek_v41", "minimax_m3", "minimax_m3_vl")
+
+
+def oq_a8_model_supported(config_type: str | None) -> bool:
+    """True for the model families the A8 prefill paths can route.
+
+    Qwen3.5/3.6/3.8 match by prefix. Qwen3.8-Flash-Next (``qwen4_exp``),
+    DeepSeek V4.1 and MiniMax M3/M3.1 match exactly: only those validated
+    checkpoint families have routed-expert A8, so a ``qwen4`` prefix would
+    admit unvalidated models.
+    """
+    config_type = str(config_type or "").lower().replace("-", "_")
+    return config_type in _A8_EXACT_MODEL_TYPES or config_type.startswith(
+        ("qwen3_5", "qwen3_6", "qwen3_8")
+    )
+
+
+def ced_prefill_on(settings: Any) -> bool:
+    """DeepSeek V4.1 CED prefill unless it was saved off."""
+    return _setting(settings, "deepseek_v41_ced_prefill_enabled") is not False
 
 
 PROFILES_VERSION = 1
@@ -297,16 +332,21 @@ class ModelSettings:
             (zero lets Accelerate choose).
         qwen35_ane_prefill_cpu_shared_resource: Use dispatch_apply's
             shared-resource scheduling attributes for manually sharded CPU work.
-        a8_prefill_enabled: Route eligible Qwen3.5/3.6/3.8 and DeepSeek V4.1
-            prefill matmuls through the INT8-activation (QxA8) tensor kernels.
+        a8_prefill_enabled: Route eligible Qwen3.5/3.6/3.8, DeepSeek V4.1 and
+            MiniMax M3 prefill matmuls through the INT8-activation (QxA8)
+            tensor kernels.
             Prefill only, and only a speed-up on hardware with native INT8
-            tensor operations -- M5-series and newer. On anything older the
-            kernels do not load and the setting is refused. Decode is
-            unaffected. Changes numerics: activations are quantized to INT8.
+            tensor operations -- M5-series and newer. On anything older it
+            applies only to a Prefill Accelerator Mac's layers. Off unless
+            saved on. Decode is unaffected. Changes numerics: activations
+            are quantized to INT8.
             Also covers the routed-expert gate/up of Qwen3.8-Flash-Next
             (affine Q4 / GS64 experts); the MTP draft layer and the down
             projection stay on the A16 path. DeepSeek V4.1 covers its affine
-            GS64 routed experts, shared expert and dense projections.
+            GS64 routed experts, shared expert and dense projections. MiniMax
+            M3/M3.1 covers its affine GS64 routed experts (NVFP4 experts stay
+            on the A16 path), shared expert and dense projections except the
+            sparse-attention indexer.
             Mutually exclusive with qwen35_ane_prefill_enabled.
         a8_prefill_min_tokens: Shortest sequence routed to the kernels.
         moe_expert_offload_enabled: Stream MoE expert weights from the
@@ -398,7 +438,13 @@ class ModelSettings:
     # DeepSeek V4.1 CED: during prefill the decoder half only forwards the
     # last window-size tokens; decoder global KV is the encoder-final
     # projection already produced by the midpoint CSA2 layer.
-    deepseek_v41_ced_prefill_enabled: bool = False
+    # None (never saved) means on; only a saved False turns it off.
+    deepseek_v41_ced_prefill_enabled: Optional[bool] = None
+    # Prefill Accelerator: the paired Mac (cluster node id) that runs the
+    # first layers of each prompt chunk, and how many (None picks them from
+    # measured speed). Applied without reloading the model.
+    prefill_helper_node_id: Optional[str] = None
+    prefill_helper_layers: Optional[int] = None
     # Recast the checkpoint's bfloat16 leaves (scales, norms, embeddings) to
     # float16 after load, so the forward runs on the GPU's native float16 path
     # instead of the emulated bfloat16 one. Quantized payloads are untouched.
@@ -460,7 +506,8 @@ class ModelSettings:
     # The kernel reads the checkpoint's own packed weight stream, so a routed
     # projection costs no extra weight memory and the module's arrays stay
     # readable by the decode path.
-    a8_prefill_enabled: bool = False
+    # None (never saved) means off.
+    a8_prefill_enabled: Optional[bool] = None
     a8_prefill_min_tokens: int = 128
 
     # MoE expert offload (stream non-resident experts from the checkpoint)
@@ -552,7 +599,7 @@ class ModelSettings:
         # The ddtree verify mode was removed; stored settings run as adaptive.
         if self.dflash_verify_mode == "ddtree":
             self.dflash_verify_mode = "adaptive"
-        if self.a8_prefill_enabled and self.a8_prefill_min_tokens < 1:
+        if a8_prefill_on(self) and self.a8_prefill_min_tokens < 1:
             raise ValueError("a8_prefill_min_tokens must be at least 1")
         # Both accelerate the same Qwen3.5 prefill projections by wrapping
         # Qwen3_5MLP.__call__, so enabling both leaves whichever patched last

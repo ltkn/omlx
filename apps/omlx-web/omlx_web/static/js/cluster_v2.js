@@ -71,14 +71,6 @@ function clusterV2Wizard() {
         runtime: '/admin/api/cluster/runtime',
         deployments: '/admin/api/cluster/deployments',
         replan: '/admin/api/cluster/replan',
-        diagnostics: '/admin/api/cluster/diagnostics',
-        joinKeys: '/admin/api/cluster/join-keys',
-        joinStatus: '/admin/api/cluster/join-status',
-        revokeJoinKey: (id) =>
-            `/admin/api/cluster/join-keys/${encodeURIComponent(id)}`,
-        cudaFabricVerify: '/admin/api/cluster/cuda-fabric/verify',
-        rdmaLinks: '/admin/api/cluster/rdma-links',
-        rdmaLinkVerify: '/admin/api/cluster/rdma-links/verify',
         deployment: (id) =>
             `/admin/api/cluster/deployments/${encodeURIComponent(id)}`,
         deploymentLoad: (id) =>
@@ -235,6 +227,15 @@ function clusterV2Wizard() {
             benchmarkRunning: false,
             ranAt: null,
         },
+        // Prefill Accelerator checks for one paired Mac (GET /check).
+        accelerator: { nodeId: null, running: false, result: null, error: '', copies: null, deleting: [] },
+        acceleratorRestored: false,
+        // On a helper Mac: its running helper and the Mac that set it up.
+        helperRole: null,
+        // A Mac that pressed Pair on this one: {node_id, name}.
+        pairInvite: null,
+        // The chooser opened by itself after pairing, not from Change setup.
+        purposeAuto: false,
 
         // ---- plan ------------------------------------------------------------
         modelOptions: [],
@@ -304,31 +305,13 @@ function clusterV2Wizard() {
         membershipProposal: null,
         membershipReturnStage: null,
 
-        // ---- bounded advanced tools (the old v1 console is removed) ---------
-        advancedOpen: false,
-        diagnosticsLoading: false,
-        diagnosticsError: '',
-        cudaJoin: {
-            controllerIp: '',
-            loading: false,
-            command: '',
-            joinId: '',
-            expiresAt: 0,
-            copied: false,
-            error: '',
-            status: { join_keys: [], nodes: [] },
-        },
-        cudaFabricLoading: false,
-        cudaFabricError: '',
-        cudaFabricResult: null,
-        cudaFabricMemberA: '',
-        cudaFabricMemberB: '',
-        rdmaLinks: { loading: false, verifying: '', error: '', data: null },
-
         // ---- feedback ----------------------------------------------------------
         toasts: [],
         toastSeq: 0,
         installCommandCopied: false,
+        cudaGuideOpen: false,
+        cudaGuideOs: 'linux',
+        cudaGuideCopied: '',
 
         pollTimer: null,
         tickBusy: false,
@@ -360,7 +343,9 @@ function clusterV2Wizard() {
             this.tickBusy = true;
             try {
                 await this.refreshDevices();
+                await this.refreshHelperRole();
                 await this.refreshJoinState();
+                await this.refreshInvite();
                 await this.refreshRuntime();
                 this.tickCount += 1;
                 if (
@@ -368,8 +353,8 @@ function clusterV2Wizard() {
                     this.tickCount % CLUSTER_V2_DEPLOYMENTS_EVERY_TICKS === 0
                 ) {
                     await this.refreshDeployments();
-                    await this.refreshRdmaLinks();
                 }
+                await this.restoreAccelerator();
             } finally {
                 this.tickBusy = false;
             }
@@ -516,7 +501,7 @@ function clusterV2Wizard() {
                         window.t('cluster.v2.toast.joined_cluster').replace('{name}', this.joinTargetName()),
                     );
                     await this.refreshDevices();
-                    this.startChecks();
+                    this.choosePurpose(true);
                 } else if (
                     snapshot.state === 'denied' &&
                     previous !== 'denied' &&
@@ -554,6 +539,13 @@ function clusterV2Wizard() {
         pairedDevices() {
             const paired = this.devicesPayload?.paired;
             return Array.isArray(paired) ? paired : [];
+        },
+
+        // Paired Macs that can share a model split. A helper daemon cannot.
+        splitDevices() {
+            return this.pairedDevices().filter(
+                (device) => !this.deviceHelperOnly(device),
+            );
         },
 
         discoveredDevices() {
@@ -1060,11 +1052,20 @@ function clusterV2Wizard() {
             // badge is driven by deploymentRuntimeState(), not by persistence.
             if (this.choosingModel && this.stage === 'plan') return 'plan';
             if (this.configuredDeployment()) return 'active';
-            if (this.stage === 'plan' && this.pairedDevices().length) {
+            if (this.stage === 'plan' && this.splitDevices().length) {
                 return 'plan';
             }
-            if (this.stage === 'checks' && this.pairedDevices().length) {
+            if (this.stage === 'checks' && this.splitDevices().length) {
                 return 'checks';
+            }
+            if (this.stage === 'purpose' && this.purposeAuto && this.helperRoleHost()) {
+                return 'helper';
+            }
+            if (
+                (this.stage === 'purpose' || this.stage === 'accelerator') &&
+                this.pairedDevices().length
+            ) {
+                return this.stage;
             }
             if (
                 this.pairing.target ||
@@ -1073,6 +1074,7 @@ function clusterV2Wizard() {
             ) {
                 return 'pairing';
             }
+            if (this.stage === null && this.helperRoleHost()) return 'helper';
             if (
                 this.discoveredDevices().length ||
                 this.pairedDevices().length
@@ -1097,12 +1099,24 @@ function clusterV2Wizard() {
                 { key: 'plan', title: window.t('cluster.v2.steps.plan_title'), hint: this.planStepHint() },
                 { key: 'active', title: window.t('cluster.v2.steps.active_title'), hint: window.t('cluster.v2.steps.active_hint') },
             ];
+            if (wizard === 'accelerator' || wizard === 'helper') {
+                // Prefill Accelerator ends at its checks; nothing is split or activated.
+                const ready =
+                    wizard === 'helper' || (!this.accelerator.running && this.acceleratorReady());
+                steps[2].hint = window.t('cluster.v2.steps.accelerator_checks_hint');
+                return steps.slice(0, 3).map((step, index) => ({
+                    ...step,
+                    state: index < 2 || ready ? 'done' : 'active',
+                }));
+            }
             // Map the 8 UI states onto the 5 step slots.
             const slotFor = {
                 empty: 0,
                 discovering: 0,
                 device_card: 1,
                 pairing: 1,
+                purpose: 2,
+                accelerator: 2,
                 checks: 2,
                 plan: 3,
                 active: 4,
@@ -1265,7 +1279,8 @@ function clusterV2Wizard() {
         versionMismatches() {
             const self = this.selfDevice();
             if (!self || !self.version) return [];
-            return this.pairedDevices()
+            // A helper daemon has its own version number.
+            return this.splitDevices()
                 .filter(
                     (device) =>
                         !device.is_self &&
@@ -1301,7 +1316,19 @@ function clusterV2Wizard() {
         },
 
         deviceChipLabel(device) {
-            return device?.caps?.chip || window.t('cluster.v2.device.apple_silicon');
+            return (
+                device?.caps?.chip ||
+                window.t(
+                    this.deviceHelperOnly(device)
+                        ? 'cluster.v2.device.cuda_helper'
+                        : 'cluster.v2.device.apple_silicon',
+                )
+            );
+        },
+
+        // A helper daemon is only a Prefill Accelerator: no SSH, no split.
+        deviceHelperOnly(device) {
+            return device?.caps?.control === 'agent';
         },
 
         deviceLoopbackOnly(device) {
@@ -1335,10 +1362,9 @@ function clusterV2Wizard() {
         },
 
         combinedMemoryLabel() {
-            const total = this.allDevices().reduce(
-                (sum, device) => sum + (this.deviceRamGb(device) || 0),
-                0,
-            );
+            const total = this.allDevices()
+                .filter((device) => !this.deviceHelperOnly(device))
+                .reduce((sum, device) => sum + (this.deviceRamGb(device) || 0), 0);
             return total ? window.t('cluster.v2.device.combined').replace('{n}', String(total)) : '';
         },
 
@@ -1352,6 +1378,46 @@ function clusterV2Wizard() {
                 busy: false,
                 error: '',
             };
+            // That Mac then asks its user to show the code; best effort.
+            this.apiFetch('/api/cluster/pair/invite', {
+                method: 'POST',
+                body: JSON.stringify({ node_id: device.node_id }),
+            }).catch(() => {});
+        },
+
+        pairingStepOne(device = this.pairing.target) {
+            // A helper daemon has no screen; its code is in its log.
+            const key = this.deviceHelperOnly(device)
+                ? 'cluster.v2.pairing.step1_helper'
+                : 'cluster.v2.pairing.step1';
+            return window.t(key)
+                .replaceAll('{name}', this.deviceName(device))
+                .replaceAll('{self}', this.deviceName(this.selfDevice()));
+        },
+
+        async refreshInvite() {
+            try {
+                this.pairInvite = (await this.apiFetch('/api/cluster/pair/invite'))?.invite || null;
+            } catch (_) {
+                this.pairInvite = null;
+            }
+        },
+
+        async acceptInvite() {
+            const device = this.discoveredDevices().find(
+                (item) => item.node_id === this.pairInvite?.node_id,
+            );
+            this.pairInvite = null;
+            if (device) await this.beginJoinAsJoiner(device);
+        },
+
+        async dismissInvite() {
+            this.pairInvite = null;
+            try {
+                await this.apiFetch('/api/cluster/pair/invite', { method: 'DELETE' });
+            } catch (_) {
+                /* it expires on its own */
+            }
         },
 
         cancelPairing() {
@@ -1381,7 +1447,10 @@ function clusterV2Wizard() {
                     window.t('cluster.v2.toast.peer_joined').replace('{name}', this.deviceName(device)),
                 );
                 this.cancelPairing();
-                if (this.membershipPanelOpen) {
+                if (this.deviceHelperOnly(device)) {
+                    // A helper daemon has one purpose, so there is no choice.
+                    this.startAccelerator(device);
+                } else if (this.membershipPanelOpen) {
                     await this.refreshDevices();
                     const paired = this.pairedDevices().find(
                         (item) => item.node_id === device.node_id,
@@ -1399,12 +1468,15 @@ function clusterV2Wizard() {
                         }
                     }
                 } else {
-                    this.startChecks();
+                    this.choosePurpose(true);
                 }
             } catch (error) {
                 if (error?.status === 404 || error?.status === 409) {
-                    this.pairing.error =
-                        window.t('cluster.v2.pair.no_request');
+                    this.pairing.error = window.t(
+                        this.deviceHelperOnly(device)
+                            ? 'cluster.v2.pair.no_request_helper'
+                            : 'cluster.v2.pair.no_request',
+                    );
                 } else if (error?.status === 403 || error?.status === 429) {
                     this.pairing.error =
                         error.message ||
@@ -1686,12 +1758,223 @@ function clusterV2Wizard() {
             this.runChecks();
         },
 
+        // A paired Mac either splits models with this one (checks, plan) or
+        // runs the first layers of this Mac's prefills (Prefill Accelerator).
+        choosePurpose(auto = false) {
+            this.stage = 'purpose';
+            this.purposeAuto = auto;
+        },
+
+        async refreshHelperRole() {
+            try {
+                this.helperRole = await this.apiFetch('/admin/api/prefill-helper/lending');
+            } catch (_) {
+                this.helperRole = null;
+            }
+        },
+
+        helperRoleHost() {
+            const role = this.helperRole;
+            return (role?.active ? role.host : '') || role?.helps?.name || '';
+        },
+
+        // Forgetting this Mac's host ends the helper role; the host can no
+        // longer reach it.
+        helperHostDevice() {
+            const nodeId = this.helperRole?.helps?.node_id;
+            return this.pairedDevices().find((item) => item.node_id === nodeId) || null;
+        },
+
+        helperRoleText() {
+            const role = this.helperRole || {};
+            const key = role.active ? 'cluster.v2.helper.active' : 'cluster.v2.helper.idle';
+            return window.t(key)
+                .replaceAll('{host}', this.helperRoleHost())
+                .replace('{n}', role.layers ?? '')
+                .replace('{model}', String(role.model || '').split('/').pop());
+        },
+
+        async stopHelping() {
+            try {
+                await this.apiFetch('/admin/api/prefill-helper/lending/stop', { method: 'POST' });
+            } catch (_) {
+                /* refreshed below */
+            }
+            await this.refreshHelperRole();
+        },
+
+        // A paired Mac that a model already uses as its Prefill Accelerator
+        // opens on that screen; Change setup goes back to the choice.
+        async restoreAccelerator() {
+            if (
+                this.acceleratorRestored ||
+                !this.devicesLoaded ||
+                !this.deploymentsLoaded ||
+                !this.pairedDevices().length
+            ) {
+                return;
+            }
+            this.acceleratorRestored = true;
+            // A model here using that Mac makes this Mac its host, even when an
+            // old record says this Mac helps it.
+            const open = () => ['device_card', 'helper'].includes(this.wizardState());
+            if (!open()) return;
+            let payload;
+            try {
+                payload = await this.apiFetch('/admin/api/models');
+            } catch (_) {
+                return;
+            }
+            const used = new Set(
+                (payload?.models || []).map((model) => model.settings?.prefill_helper_node_id),
+            );
+            // A helper daemon is only ever a Prefill Accelerator; one that
+            // answers comes first.
+            const helpers = this.pairedDevices().filter((item) => this.deviceHelperOnly(item));
+            const device =
+                this.pairedDevices().find((item) => used.has(item.node_id)) ||
+                helpers.find((item) => item.state !== 'dead') ||
+                helpers[0];
+            if (device && open()) this.startAccelerator(device, { asHost: true });
+        },
+
+        async startAccelerator(device, { asHost = false } = {}) {
+            if (!asHost && device && this.helperRole?.helps?.node_id === device.node_id) {
+                // This Mac is that Mac's Prefill Accelerator, not its host.
+                this.stage = null;
+                return;
+            }
+            this.stage = 'accelerator';
+            this.accelerator = {
+                nodeId: device.node_id,
+                running: true,
+                result: null,
+                error: '',
+                copies: null,
+                deleting: [],
+            };
+            this.loadAcceleratorCopies();
+            try {
+                const result = await this.apiFetch(
+                    '/admin/api/prefill-helper/check?node_id=' +
+                        encodeURIComponent(device.node_id),
+                );
+                if (this.accelerator.nodeId === device.node_id) {
+                    this.accelerator.result = result;
+                }
+            } catch (error) {
+                if (this.accelerator.nodeId === device.node_id) {
+                    this.accelerator.error =
+                        error?.message || window.t('cluster.v2.err.probe_failed');
+                }
+            } finally {
+                if (this.accelerator.nodeId === device.node_id) {
+                    this.accelerator.running = false;
+                }
+            }
+        },
+
+        // Model copies this Mac made on the helper; its own model folders never show here.
+        async loadAcceleratorCopies(remove = '') {
+            const nodeId = this.accelerator.nodeId;
+            const query = 'node_id=' + encodeURIComponent(nodeId)
+                + (remove ? '&name=' + encodeURIComponent(remove) : '');
+            if (remove) this.accelerator.deleting = [...this.accelerator.deleting, remove];
+            try {
+                const result = await this.apiFetch(
+                    '/admin/api/prefill-helper/copies' + (remove ? '/delete?' : '?') + query,
+                    remove ? { method: 'POST' } : {},
+                );
+                if (this.accelerator.nodeId === nodeId) this.accelerator.copies = result;
+            } catch (_) {
+                // A failed delete keeps the list as it was.
+                if (!remove && this.accelerator.nodeId === nodeId) this.accelerator.copies = null;
+            } finally {
+                if (remove && this.accelerator.nodeId === nodeId) {
+                    this.accelerator.deleting = this.accelerator.deleting.filter((name) => name !== remove);
+                }
+            }
+        },
+
+        acceleratorName() {
+            const device = this.pairedDevices().find(
+                (item) => item.node_id === this.accelerator.nodeId,
+            );
+            return this.accelerator.result?.name || this.deviceName(device);
+        },
+
+        acceleratorRows() {
+            const rows = this.accelerator.result?.rows || [];
+            const name = this.acceleratorName();
+            const t = (key) => window.t('cluster.v2.accelerator.' + key);
+            const size = (bytes) => this.formatSizeBytes(Number(bytes || 0));
+            // A helper daemon answers on its control channel instead of SSH.
+            const helper = rows.some((row) => row.key === 'control');
+            return rows.map((row) => {
+                let detail = row.detail || '';
+                let label = t('row_' + row.key);
+                if (['ssh', 'control'].includes(row.key) && row.status === 'pass') {
+                    detail = t(row.key + '_ok').replace('{target}', row.detail);
+                } else if (row.key === 'link') {
+                    const mbps = Number(row.speed_mbps || 0);
+                    const speed = mbps >= 1000 ? `${mbps / 1000} Gb` : `${mbps} Mb`;
+                    const ethernet = t('link_ethernet').replace('{speed}', speed);
+                    if (['thunderbolt', 'rdma'].includes(row.detail)) {
+                        detail = t('link_fast');
+                    } else if (row.status === 'pass') {
+                        detail = ethernet;
+                    } else if (mbps >= 2500) {
+                        detail = t('link_ethernet_ok').replace('{speed}', speed);
+                    } else {
+                        const kind = row.detail === 'wifi' ? 'Wi-Fi' : (mbps ? ethernet : 'Ethernet');
+                        detail = t(helper ? 'link_slow_helper' : 'link_slow').replace('{kind}', kind);
+                    }
+                } else if (row.key === 'version' && helper) {
+                    // The helper has its own version; an error text stays as is.
+                    label = t('row_version_helper');
+                    if (row.families) {
+                        detail = t(row.status === 'pass' ? 'version_ok_helper' : 'version_mismatch_helper')
+                            .replace('{version}', row.detail || '?');
+                    }
+                } else if (row.key === 'version') {
+                    detail = row.status === 'pass'
+                        ? t('version_ok').replace('{version}', row.detail)
+                        : t('version_mismatch')
+                            .replaceAll('{name}', name)
+                            .replace('{version}', row.detail || '?')
+                            .replace('{expected}', row.expected || '?');
+                } else if (row.key === 'memory' && row.gpus) {
+                    detail = t('memory_detail_helper')
+                        .replace('{size}', size(row.bytes))
+                        .replace('{n}', row.gpus);
+                } else if (row.key === 'memory') {
+                    detail = t('memory_detail').replace('{size}', size(row.bytes));
+                } else if (row.key === 'disk') {
+                    detail = t('disk_detail').replace('{size}', size(row.bytes));
+                } else if (row.key === 'power') {
+                    detail = row.status === 'pass' ? t('power_ok') : t('power_battery');
+                }
+                return {
+                    key: row.key,
+                    status: row.status,
+                    label,
+                    detail,
+                    fix: row.fix || '',
+                };
+            });
+        },
+
+        acceleratorReady() {
+            const rows = this.accelerator.result?.rows || [];
+            return rows.length > 0 && rows.every((row) => row.status !== 'fail');
+        },
+
         async runChecks() {
             if (this.checks.running) return;
             this.stage = 'checks';
             this.checks.started = true;
             this.checks.running = true;
-            const peers = this.pairedDevices();
+            const peers = this.splitDevices();
             await Promise.all([
                 ...peers.map((peer) => this.probePeer(peer)),
                 this.refreshDiscoveryHealth(),
@@ -1810,7 +2093,7 @@ function clusterV2Wizard() {
         },
 
         checkRows() {
-            const peers = this.pairedDevices();
+            const peers = this.splitDevices();
             const rows = [];
             const allPass = (list) => list.every(Boolean);
 
@@ -1869,6 +2152,7 @@ function clusterV2Wizard() {
                     const missing = this.allDevices().filter(
                         (device) =>
                             device.paired !== false &&
+                            !this.deviceHelperOnly(device) &&
                             !holders.has(device.node_id) &&
                             !device.is_self &&
                             !(this.selfDevice() && holders.has('127.0.0.1')),
@@ -2085,7 +2369,10 @@ function clusterV2Wizard() {
         // The paired Macs that will receive layers (this Mac included).
         planRoleDevices() {
             return this.allDevices().filter(
-                (device) => device.paired && this.deviceRamGb(device),
+                (device) =>
+                    device.paired &&
+                    !this.deviceHelperOnly(device) &&
+                    this.deviceRamGb(device),
             );
         },
 
@@ -2168,7 +2455,7 @@ function clusterV2Wizard() {
                     ssh: '127.0.0.1',
                 },
             ];
-            for (const peer of this.pairedDevices()) {
+            for (const peer of this.splitDevices()) {
                 hosts.push({
                     node_id: peer.node_id,
                     ssh: this.sshTargetFor(peer),
@@ -2256,7 +2543,7 @@ function clusterV2Wizard() {
                 (model?.locations || []).map((loc) => loc.node_id),
             );
             const total =
-                (this.selfDevice() ? 1 : 0) + this.pairedDevices().length;
+                (this.selfDevice() ? 1 : 0) + this.splitDevices().length;
             if (!total) return '';
             const have = Math.min(holders.size, total);
             if (have >= total) return t('cluster.v2.models.on_every_mac');
@@ -2537,7 +2824,7 @@ function clusterV2Wizard() {
                     accelerator: 'metal',
                 });
             }
-            for (const peer of this.pairedDevices()) {
+            for (const peer of this.splitDevices()) {
                 nodes.push({
                     node_id: peer.node_id,
                     capacity_bytes:
@@ -2707,7 +2994,7 @@ function clusterV2Wizard() {
             if (['jaccl', 'jaccl-ring', 'ring'].includes(serverBackend)) {
                 return serverBackend;
             }
-            const members = [this.selfDevice(), ...this.pairedDevices()].filter(
+            const members = [this.selfDevice(), ...this.splitDevices()].filter(
                 Boolean,
             );
             const allJaccl =
@@ -2744,7 +3031,7 @@ function clusterV2Wizard() {
                     rdma: [],
                 });
             }
-            for (const peer of this.pairedDevices()) {
+            for (const peer of this.splitDevices()) {
                 hosts.push({
                     node_id: peer.node_id,
                     ssh: this.sshTargetFor(peer),
@@ -3206,7 +3493,7 @@ function clusterV2Wizard() {
 
         membershipCandidates(deployment = this.configuredDeployment()) {
             const active = this.deploymentMemberIds(deployment);
-            return this.pairedDevices().filter(
+            return this.splitDevices().filter(
                 (device) => device?.node_id && !active.has(device.node_id),
             );
         },
@@ -3618,289 +3905,6 @@ function clusterV2Wizard() {
         },
 
         // =====================================================================
-        // Advanced tools — CUDA enrollment/fabric proof and diagnostics
-        // =====================================================================
-        async toggleAdvancedTools() {
-            this.advancedOpen = !this.advancedOpen;
-            if (this.advancedOpen) await this.loadCudaJoinStatus();
-        },
-
-        cudaNodes() {
-            return Array.isArray(this.cudaJoin.status?.nodes)
-                ? this.cudaJoin.status.nodes
-                : [];
-        },
-
-        cudaJoinSuggestedIp() {
-            const explicit = String(this.cudaJoin.controllerIp || '').trim();
-            if (explicit) return explicit;
-            const addresses = this.selfDevice()?.addrs || [];
-            const local = addresses.find(
-                (item) =>
-                    item?.ip &&
-                    /^\d{1,3}(?:\.\d{1,3}){3}$/.test(String(item.ip)) &&
-                    !String(item.ip).startsWith('127.'),
-            );
-            if (local) return String(local.ip);
-            const host = String(window.location?.hostname || '');
-            return /^\d{1,3}(?:\.\d{1,3}){3}$/.test(host) &&
-                !host.startsWith('127.')
-                ? host
-                : '';
-        },
-
-        cudaJoinState() {
-            const id = this.cudaJoin.joinId;
-            return (this.cudaJoin.status?.join_keys || []).find(
-                (item) => item.join_id === id,
-            );
-        },
-
-        cudaJoinCommandUsable() {
-            const state = this.cudaJoinState();
-            const expiresAt = Number(
-                state?.expires_at || this.cudaJoin.expiresAt || 0,
-            );
-            return Boolean(
-                this.cudaJoin.command &&
-                (!state || state.status === 'pending') &&
-                expiresAt * 1000 > Date.now(),
-            );
-        },
-
-        cudaJoinStatusLabel() {
-            if (!this.cudaJoin.command) return '';
-            const state = this.cudaJoinState();
-            if (state?.status === 'used') {
-                return window.t('cluster.v2.cuda.used');
-            }
-            if (state?.status === 'revoked') return window.t('cluster.v2.cuda.revoked');
-            const remaining = Math.ceil(
-                (Number(state?.expires_at || this.cudaJoin.expiresAt || 0) *
-                    1000 -
-                    Date.now()) /
-                    60000,
-            );
-            return remaining > 0
-                ? window.t('cluster.v2.cuda.expires_in').replace('{n}', String(remaining))
-                : window.t('cluster.v2.cuda.expired');
-        },
-
-        async loadCudaJoinStatus() {
-            try {
-                const payload = await this.apiFetch(CLUSTER_V2_API.joinStatus, {
-                    cache: 'no-store',
-                });
-                this.cudaJoin.status = payload || { join_keys: [], nodes: [] };
-                const ids = this.cudaNodes().map((node) => node.node_id);
-                if (!ids.includes(this.cudaFabricMemberA)) {
-                    this.cudaFabricMemberA = ids[0] || '';
-                }
-                if (
-                    !ids.includes(this.cudaFabricMemberB) ||
-                    this.cudaFabricMemberB === this.cudaFabricMemberA
-                ) {
-                    this.cudaFabricMemberB =
-                        ids.find((id) => id !== this.cudaFabricMemberA) || '';
-                }
-                this.cudaJoin.error = payload?.load_error || '';
-            } catch (error) {
-                this.cudaJoin.error =
-                    error?.message || window.t('cluster.v2.err.cuda_status');
-            }
-        },
-
-        async revokeCudaJoinCommand() {
-            const id = String(this.cudaJoin.joinId || '').trim();
-            if (!id) return;
-            try {
-                await this.apiFetch(CLUSTER_V2_API.revokeJoinKey(id), {
-                    method: 'DELETE',
-                });
-                this.cudaJoin.command = '';
-                this.cudaJoin.joinId = '';
-                this.cudaJoin.expiresAt = 0;
-                await this.loadCudaJoinStatus();
-            } catch (error) {
-                if (error?.status === 404) {
-                    this.cudaJoin.command = '';
-                    this.cudaJoin.joinId = '';
-                    await this.loadCudaJoinStatus();
-                    return;
-                }
-                this.cudaJoin.error =
-                    error?.message || window.t('cluster.v2.err.revoke_join');
-            }
-        },
-
-        async generateCudaJoinCommand() {
-            if (this.cudaJoin.loading) return;
-            const controllerIp = this.cudaJoinSuggestedIp();
-            if (!controllerIp) {
-                this.cudaJoin.error =
-                    window.t('cluster.v2.cuda.controller_ip_required');
-                return;
-            }
-            this.cudaJoin.controllerIp = controllerIp;
-            this.cudaJoin.loading = true;
-            this.cudaJoin.error = '';
-            try {
-                if (this.cudaJoinCommandUsable()) {
-                    await this.revokeCudaJoinCommand();
-                    if (this.cudaJoin.error) return;
-                }
-                const secure = window.location?.protocol === 'https:';
-                const port = Number(window.location?.port) || (secure ? 443 : 80);
-                const result = await this.apiFetch(CLUSTER_V2_API.joinKeys, {
-                    method: 'POST',
-                    cache: 'no-store',
-                    body: JSON.stringify({
-                        controller_ip: controllerIp,
-                        controller_port: port,
-                        scheme: secure ? 'https' : 'http',
-                        ttl_seconds: 1800,
-                    }),
-                });
-                this.cudaJoin.command = result?.command || '';
-                this.cudaJoin.joinId = result?.join_id || '';
-                this.cudaJoin.expiresAt = Number(result?.expires_at || 0);
-                await this.loadCudaJoinStatus();
-            } catch (error) {
-                this.cudaJoin.error =
-                    error?.message || window.t('cluster.v2.err.cuda_join');
-            } finally {
-                this.cudaJoin.loading = false;
-            }
-        },
-
-        copyCudaJoinCommand() {
-            const command = this.cudaJoin.command;
-            if (!command) return;
-            const done = () => {
-                this.cudaJoin.copied = true;
-                setTimeout(() => (this.cudaJoin.copied = false), 2000);
-            };
-            if (navigator.clipboard?.writeText) {
-                navigator.clipboard.writeText(command).then(done, done);
-            } else {
-                done();
-            }
-        },
-
-        async verifyCudaFabric() {
-            const selected = new Set([
-                this.cudaFabricMemberA,
-                this.cudaFabricMemberB,
-            ]);
-            const nodes = this.cudaNodes().filter((node) =>
-                selected.has(node.node_id),
-            );
-            if (nodes.length !== 2 || this.cudaFabricLoading) return;
-            this.cudaFabricLoading = true;
-            this.cudaFabricError = '';
-            this.cudaFabricResult = null;
-            try {
-                this.cudaFabricResult = await this.apiFetch(
-                    CLUSTER_V2_API.cudaFabricVerify,
-                    {
-                        method: 'POST',
-                        body: JSON.stringify({
-                            hosts: nodes.map((node) => ({
-                                node_id: node.node_id,
-                                ssh: node.ssh,
-                            })),
-                        }),
-                    },
-                );
-                this.notify('success', window.t('cluster.v2.toast.cuda_verified'));
-                await this.refreshDevices();
-            } catch (error) {
-                this.cudaFabricError =
-                    error?.message || window.t('cluster.v2.err.cuda_verify');
-            } finally {
-                this.cudaFabricLoading = false;
-            }
-        },
-
-        async refreshRdmaLinks() {
-            if (this.rdmaLinks.loading) return;
-            this.rdmaLinks.loading = true;
-            try {
-                this.rdmaLinks.data = await this.apiFetch(CLUSTER_V2_API.rdmaLinks);
-                this.rdmaLinks.error = '';
-            } catch (error) {
-                this.rdmaLinks.error =
-                    error?.message || window.t('cluster.v2.err.rdma_links');
-            } finally {
-                this.rdmaLinks.loading = false;
-            }
-        },
-
-        async verifyRdmaLink(name) {
-            if (this.rdmaLinks.verifying) return;
-            this.rdmaLinks.verifying = name;
-            this.rdmaLinks.error = '';
-            try {
-                const result = await this.apiFetch(CLUSTER_V2_API.rdmaLinkVerify, {
-                    method: 'POST',
-                    body: JSON.stringify({ link: name }),
-                });
-                if (result.verified) {
-                    this.notify('success', window.t('cluster.v2.toast.rdma_verified'));
-                } else {
-                    this.rdmaLinks.error = result.reason || window.t('cluster.v2.err.rdma_verify');
-                }
-                await this.refreshRdmaLinks();
-            } catch (error) {
-                this.rdmaLinks.error =
-                    error?.message || window.t('cluster.v2.err.rdma_verify');
-            } finally {
-                this.rdmaLinks.verifying = '';
-            }
-        },
-
-        rdmaLinkDetail(link) {
-            const measured = link.verification?.measurements;
-            if (!link.verified || !measured) {
-                return link.stale_reason || link.reason || '';
-            }
-            return window.t('cluster.v2.rdma.measured')
-                .replace('{latency}', measured.latency_p50_us.toFixed(1))
-                .replace('{to}', measured.to_peer_gbit_s.toFixed(1))
-                .replace('{from}', measured.from_peer_gbit_s.toFixed(1));
-        },
-
-        async downloadClusterDiagnostics() {
-            if (this.diagnosticsLoading) return;
-            this.diagnosticsLoading = true;
-            this.diagnosticsError = '';
-            try {
-                const report = await this.apiFetch(CLUSTER_V2_API.diagnostics, {
-                    cache: 'no-store',
-                });
-                const blob = new Blob(
-                    [JSON.stringify(report, null, 2) + '\n'],
-                    { type: 'application/json' },
-                );
-                const link = document.createElement('a');
-                const url = URL.createObjectURL(blob);
-                link.href = url;
-                link.download = `omlx-cluster-diagnostics-${new Date()
-                    .toISOString()
-                    .replaceAll(':', '-')}.json`;
-                document.body.appendChild(link);
-                link.click();
-                link.remove();
-                URL.revokeObjectURL(url);
-            } catch (error) {
-                this.diagnosticsError =
-                    error?.message || window.t('cluster.v2.err.diagnostics');
-            } finally {
-                this.diagnosticsLoading = false;
-            }
-        },
-
-        // =====================================================================
         // Feedback — toasts, never modals
         // =====================================================================
         notify(type, message, timeoutMs = 6000) {
@@ -3937,6 +3941,80 @@ function clusterV2Wizard() {
             this.devicesUnreachable = false;
             this.devicesFailureCount = 0;
             this.refreshDevices();
+        },
+
+        // This Mac's address for a helper that asks it to pair: the one the
+        // page was opened at, else a LAN address that is not a bridge's.
+        cudaGuideMacAddress() {
+            const host = window.location.hostname;
+            if (/^\d+\.\d+\.\d+\.\d+$/.test(host) && !host.startsWith('127.')) {
+                return host;
+            }
+            const ipv4 = (this.selfDevice()?.addrs || [])
+                .map((addr) => addr.ip)
+                .filter((ip) => /^\d+\.\d+\.\d+\.\d+$/.test(ip) && !ip.startsWith('127.'));
+            return ipv4.find((ip) => !ip.endsWith('.1')) || ipv4[0] || 'MAC_ADDRESS';
+        },
+
+        cudaGuideSteps() {
+            const image = 'jundot/omlx-cuda-helper';
+            const run = 'sudo docker run -d --name omlx-helper --restart unless-stopped --gpus all '
+                + `--network host -v omlx-helper:/data ${image}\nsudo docker logs -f omlx-helper`;
+            if (this.cudaGuideOs === 'windows') {
+                const port = this.selfDevice()?.http_port || window.location.port || 8000;
+                return [
+                    {
+                        text: 'cluster.v2.cuda_guide.windows_docker',
+                        command: 'winget install -e --id Docker.DockerDesktop',
+                    },
+                    {
+                        text: 'cluster.v2.cuda_guide.windows_firewall',
+                        command: 'New-NetFirewallRule -DisplayName "oMLX helper" -Direction Inbound '
+                            + '-Protocol TCP -LocalPort 8850-8852 -Action Allow',
+                    },
+                    {
+                        text: 'cluster.v2.cuda_guide.windows_run',
+                        command: 'docker run -d --name omlx-helper --restart unless-stopped --gpus all '
+                            + `-p 8850-8852:8850-8852 -v omlx-helper:/data ${image} `
+                            + `--no-mdns --pair ${this.cudaGuideMacAddress()}:${port}\n`
+                            + 'docker logs -f omlx-helper',
+                    },
+                ];
+            }
+            if (this.cudaGuideOs === 'spark') {
+                return [{ text: 'cluster.v2.cuda_guide.spark_run', command: run }];
+            }
+            const keyring = '/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg';
+            return [
+                {
+                    text: 'cluster.v2.cuda_guide.linux_docker',
+                    command: [
+                        'curl -fsSL https://get.docker.com | sudo sh',
+                        'curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey'
+                            + ` | sudo gpg --yes --dearmor -o ${keyring}`,
+                        'curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list'
+                            + ` | sed 's#deb https://#deb [signed-by=${keyring}] https://#g'`
+                            + ' | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list',
+                        'sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit',
+                        'sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker',
+                    ].join('\n'),
+                },
+                { text: 'cluster.v2.cuda_guide.linux_run', command: run },
+            ];
+        },
+
+        copyCudaGuide(command, key) {
+            const done = () => {
+                this.cudaGuideCopied = key;
+                setTimeout(() => {
+                    if (this.cudaGuideCopied === key) this.cudaGuideCopied = '';
+                }, 2000);
+            };
+            if (navigator.clipboard?.writeText) {
+                navigator.clipboard.writeText(command).then(done, done);
+            } else {
+                done();
+            }
         },
 
         copyInstallCommand() {

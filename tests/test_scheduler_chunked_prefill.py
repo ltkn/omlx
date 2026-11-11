@@ -31,6 +31,7 @@ from omlx.prefill.packed import (
     PackedBatch,
     PackedRow,
     PackedRows,
+    _wrap_mixer,
     install_packed_prefill,
     packed_min_row_tokens,
     run_packed_prefill,
@@ -177,6 +178,16 @@ def test_prefill_interrupts_mtp_cost_timing(chunked):
     assert model.chunk_lengths == [8]
     assert policy.cycle_time_ms("mtp", 2.0, 2.02) is None
     assert abs(policy.cycle_time_ms("mtp", 2.025, 2.04) - 20) < 1e-6
+
+
+def test_prefill_chunk_forward_is_counted():
+    """step() reports ran_prefill_chunk from this counter (#5148)."""
+    scheduler, model = _make_recording_scheduler("qwen3_5_moe")
+    state = _make_prefill_state(scheduler, _make_request("counted"), n_remaining=8)
+    with patch("omlx.scheduler._sync_and_clear_cache"):
+        scheduler._step_prefill_chunk(state)
+    assert model.chunk_lengths == [8]
+    assert scheduler._prefill_forwards == 1
 
 
 def test_prefill_progress_keeps_memory_admission_waiting():
@@ -1979,6 +1990,22 @@ def _assert_same_cache(actual, expected):
     for a, b in zip(actual, expected):
         assert a.shape == b.shape
         assert mx.array_equal(a, b).item()
+
+
+def test_packed_wrapper_follows_a_later_patch_of_an_inherited_call():
+    """Qwen4 GDN inherits __call__; a patch of the base class applied after
+    the packed wrapper (the GDN prework decode) must still reach it."""
+
+    class Base:
+        def __call__(self, inputs, mask=None, cache=None):
+            return "original"
+
+    class Child(Base):
+        pass
+
+    _wrap_mixer(Child, lambda x, cache: None, x_arg="inputs")
+    Base.__call__ = lambda self, inputs, mask=None, cache=None: "patched"
+    assert Child()(mx.zeros((1, 2))) == "patched"
 
 
 @pytest.mark.parametrize(

@@ -32,6 +32,7 @@ from omlx.cluster.discovery import (
     decode_wassup,
     encode_hello,
     encode_wassup,
+    interface_link,
 )
 from omlx.cluster.identity import NodeIdentity
 from omlx.cluster.registry import DeviceRegistry
@@ -742,6 +743,49 @@ def test_link_classification():
     assert _classify_link("10.0.0.1", "unknown", 0.050) == "wifi"
 
 
+def test_interface_link_names_the_local_port_of_a_direct_route(monkeypatch):
+    routes = {
+        "192.168.2.2": "  interface: bridge0\n",
+        "192.168.1.9": "  interface: en1\n",
+        "192.168.1.30": "  interface: en0\n",
+        # Through a router the far side's link is unknown.
+        "10.9.9.9": "    gateway: 192.168.1.1\n  interface: en0\n",
+    }
+    ports = (
+        "Hardware Port: Ethernet\nDevice: en0\n\n"
+        "Hardware Port: Wi-Fi\nDevice: en1\n\n"
+        "Hardware Port: Thunderbolt Bridge\nDevice: bridge0\n"
+    )
+
+    def run(argv, **kwargs):
+        return SimpleNamespace(
+            stdout=ports if argv[0].endswith("networksetup") else routes[argv[-1]]
+        )
+
+    monkeypatch.setattr("omlx.cluster.discovery.subprocess.run", run)
+    monkeypatch.setattr("omlx.cluster.discovery.sys.platform", "darwin")
+    monkeypatch.setattr("omlx.cluster.discovery._link_cache", {})
+    monkeypatch.setattr("omlx.cluster.discovery._port_cache", [0.0, None])
+    assert [interface_link(ip) for ip in routes] == ["tb", "wifi", "ethernet", None]
+
+
+def test_a_mac_shows_its_fastest_verified_link_not_the_last_probed(monkeypatch):
+    links = {"10.0.1.5": "tb", "10.0.0.5": "wifi"}
+    monkeypatch.setattr("omlx.cluster.discovery.interface_link", links.get)
+    service, _ = _service(
+        "aaaa-node",
+        prober=lambda ip, port, timeout: {
+            "node_id": "bbbb-node",
+            "version": "0.6.1",
+            "cluster_name": "omlx",
+        },
+    )
+    for ip in links:
+        service.add_manual(ip, 8000)
+        service.probe_candidate_now(ip, 8000)
+    assert service.peers()[0].link == "tb"
+
+
 # -- mDNS -----------------------------------------------------------------------
 
 
@@ -1335,6 +1379,22 @@ def test_address_health_requires_repeated_failures_and_recovers():
     }
     clock.advance(service.config.dead_after)
     assert service.address_health("peer")["192.0.2.1"]["state"] == "stale"
+
+
+def test_a_helper_daemon_names_itself_in_the_probe_reply():
+    """A manually added helper has no mDNS TXT; its probe reply carries caps."""
+    reply = {
+        "node_id": "helper",
+        "caps": {"chip": "2x NVIDIA RTX A6000", "ram_gb": 96.0, "control": "agent"},
+    }
+    service, _ = _service(prober=lambda *_: reply)
+    service._add_candidate("192.0.2.9", 8765, node_id="helper", if_type="manual")
+    service._probe_candidate("192.0.2.9", 8765)
+    caps = next(p for p in service.peers() if p.node_id == "helper").caps
+    assert (caps.chip, caps.control) == ("2x NVIDIA RTX A6000", "agent")
+    assert caps.to_dict()["control"] == "agent"
+    # Any other value is dropped, and a Mac's caps keep their key set.
+    assert "control" not in PeerCaps.from_dict({"control": "ssh"}).to_dict()
 
 
 def test_address_health_does_not_inherit_other_node_identity():

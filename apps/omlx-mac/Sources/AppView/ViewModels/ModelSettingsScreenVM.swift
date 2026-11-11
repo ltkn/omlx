@@ -40,6 +40,7 @@ final class ModelSettingsScreenVM {
         case repetitionPenalty, presencePenalty, ttl
         case enableThinking, ssdNgramOffload
         case deepseekV41CedPrefill, qwen4GdnDecodeWideProj, activationFp16
+        case prefillHelper
         case thinkingBudgetEnabled, thinkingBudgetTokens
         case limitToolResults, toolResultLimitTokens
         case limitGpuPower, gpuPowerLimitWatts
@@ -264,6 +265,18 @@ final class ModelSettingsScreenVM {
     var deepseekV41EngramSsdOffloadSupported: Bool = false
     var deepseekV41EngramSsdOffloadForced: Bool = false
     var deepseekV41CedPrefillEnabled: Bool = false
+    // Prefill Accelerator: per model, outside profiles, saved on change.
+    var prefillHelperSupported: Bool = false
+    /// Node id of the helper Mac; empty is off.
+    var prefillHelperNodeID: String = ""
+    /// Layers on the helper; nil splits by measured speed.
+    var prefillHelperLayers: Int? = nil
+    var prefillHelperCandidates: [PrefillHelperCandidatesDTO.Device] = []
+    var prefillHelperCandidatesLoading: Bool = false
+    /// False while the server's cluster setting is off (no pairing to use).
+    var prefillHelperAvailable: Bool = true
+    var prefillHelperStatus: PrefillHelperStatusDTO? = nil
+    var prefillHelperBusy: Bool = false
     var qwen4GdnDecodeWideProj: Bool = false
     var activationFp16Enabled: Bool = false
     var thinkingBudgetEnabled: Bool = false
@@ -563,6 +576,7 @@ final class ModelSettingsScreenVM {
             return true
         case .enableThinking, .ssdNgramOffload,
              .deepseekV41CedPrefill, .qwen4GdnDecodeWideProj, .activationFp16,
+             .prefillHelper,
              .thinkingBudgetEnabled, .thinkingBudgetTokens:
             return true
         case .limitToolResults, .toolResultLimitTokens:
@@ -737,7 +751,12 @@ final class ModelSettingsScreenVM {
                     m.deepseekV41EngramSsdOffloadSupported ?? false
                 self.deepseekV41EngramSsdOffload = self.deepseekV41EngramSsdOffloadForced
                     || (s?.deepseekV41EngramSsdOffload ?? false)
-                self.deepseekV41CedPrefillEnabled = s?.deepseekV41CedPrefillEnabled ?? false
+                // Unset means on; only a saved false is off.
+                self.deepseekV41CedPrefillEnabled = s?.deepseekV41CedPrefillEnabled ?? true
+                self.prefillHelperSupported = m.prefillHelperSupported ?? false
+                self.prefillHelperNodeID = s?.prefillHelperNodeId ?? ""
+                self.prefillHelperLayers = s?.prefillHelperLayers
+                self.prefillHelperStatus = m.prefillHelper
                 self.qwen4GdnDecodeWideProj = s?.qwen4GdnDecodeWideProj ?? false
                 self.activationFp16Enabled = s?.activationFp16Enabled ?? false
                 self.thinkingBudgetEnabled = s?.thinkingBudgetEnabled ?? false
@@ -906,6 +925,11 @@ final class ModelSettingsScreenVM {
         case .qwen4GdnDecodeWideProj:
             guard isQwen4Exp else { return }
             patch.qwen4GdnDecodeWideProj = qwen4GdnDecodeWideProj
+        case .prefillHelper:
+            guard prefillHelperSupported else { return }
+            let off = prefillHelperNodeID.isEmpty
+            patch.prefillHelperNodeId = .some(off ? nil : prefillHelperNodeID)
+            patch.prefillHelperLayers = .some(off ? nil : prefillHelperLayers)
         case .activationFp16:          patch.activationFp16Enabled = activationFp16Enabled
         case .thinkingBudgetEnabled:   patch.thinkingBudgetEnabled = thinkingBudgetEnabled
         case .thinkingBudgetTokens:    patch.thinkingBudgetTokens = Int(thinkingBudgetTokens)
@@ -1081,6 +1105,53 @@ final class ModelSettingsScreenVM {
             await reportFailedSave(error, modelID: targetModelID, client: client,
                                    preservingEdits: true)
         }
+    }
+
+    // MARK: - Prefill Accelerator
+
+    func loadPrefillHelperCandidates(client: OMLXClient) async {
+        guard prefillHelperSupported else { return }
+        let target = modelID
+        prefillHelperCandidatesLoading = true
+        defer { if modelID == target { prefillHelperCandidatesLoading = false } }
+        do {
+            let result = try await client.prefillHelperCandidates(id: target)
+            guard modelID == target else { return }
+            prefillHelperCandidates = result.devices
+            prefillHelperAvailable = true
+        } catch OMLXClientError.http(let status, _) where status == 403 || status == 404 {
+            // The endpoints exist only while the cluster setting is on.
+            if modelID == target { prefillHelperAvailable = false }
+        } catch {
+            if modelID == target { lastError = String(describing: error) }
+        }
+    }
+
+    func refreshPrefillHelperStatus(client: OMLXClient) async {
+        guard prefillHelperSupported, prefillHelperAvailable else { return }
+        let target = modelID
+        if let status = try? await client.prefillHelperStatus(id: target), modelID == target {
+            prefillHelperStatus = status
+        }
+    }
+
+    /// `action` is copy, retry or stop.
+    func prefillHelperAction(_ action: String, client: OMLXClient) async {
+        let target = modelID
+        prefillHelperBusy = true
+        defer { prefillHelperBusy = false }
+        do {
+            let status = try await client.prefillHelperAction(id: target, action: action)
+            if modelID == target { prefillHelperStatus = status }
+        } catch {
+            lastError = String(describing: error)
+        }
+    }
+
+    /// Layer counts the chosen Mac can hold, plus the saved count.
+    var prefillHelperLayerChoices: [Int] {
+        let fit = prefillHelperCandidates.first { $0.nodeId == prefillHelperNodeID }?.layersFit ?? 0
+        return Array(1...max(1, max(fit, prefillHelperLayers ?? 0)))
     }
 
     func startANETuning(client: OMLXClient) async {
@@ -1282,21 +1353,23 @@ final class ModelSettingsScreenVM {
     }
 
     var isA8PrefillModel: Bool {
-        // qwen4_exp (Qwen3.8-Flash-Next) and DeepSeek V4.1 match exactly: only
-        // those validated families have routed-expert A8, not every qwen4*.
+        // Exact matches: only these validated families have routed-expert A8.
         if isQwen4Exp || isDeepseekV41 { return true }
         let type = (model?.configModelType ?? "").lowercased().replacingOccurrences(of: "-", with: "_")
+        if type == "minimax_m3" || type == "minimax_m3_vl" { return true }
         return ["qwen3_5", "qwen3_6", "qwen3_8"].contains { type.hasPrefix($0) }
     }
 
     var isQwen35AnePrefillModel: Bool { model?.anePrefillBackend == "qwen" }
 
+    /// A8 here reaches only the layers on the Prefill Accelerator Mac.
     /// The INT8 kernels run only on GPUs with native INT8 tensor ops
-    /// (M5-series or newer). A saved "on" keeps the row so it can be
-    /// turned off.
+    /// (M5-series or newer), here or on the Prefill Accelerator Mac. A saved
+    /// "on" keeps the row so it can be turned off.
     var showsA8Prefill: Bool {
         isA8PrefillModel
-            && (model?.a8PrefillSupported == true || model?.settings?.a8PrefillEnabled == true)
+            && (model?.a8PrefillSupported == true || model?.settings?.a8PrefillEnabled == true
+                || !prefillHelperNodeID.isEmpty)
     }
 
     /// Native Lightning MTP can't co-exist with the other speculative
@@ -1766,9 +1839,12 @@ final class ModelSettingsScreenVM {
                     out[ProfileSettingsKey.turboquantKvBits] = AnyCodable(bits)
                 }
             }
-            putBool(ProfileSettingsKey.a8PrefillEnabled, a8PrefillEnabled)
-            if a8PrefillEnabled {
-                putInt(ProfileSettingsKey.a8PrefillMinTokens, a8PrefillMinTokens)
+            // A hidden A8 row stays unset rather than saved.
+            if showsA8Prefill {
+                putBool(ProfileSettingsKey.a8PrefillEnabled, a8PrefillEnabled)
+                if a8PrefillEnabled {
+                    putInt(ProfileSettingsKey.a8PrefillMinTokens, a8PrefillMinTokens)
+                }
             }
             putBool(ProfileSettingsKey.qwen35AnePrefillEnabled, qwen35AnePrefillEnabled)
             if qwen35AnePrefillEnabled {

@@ -91,7 +91,7 @@
         'muse_glimmer_assistant',
     ]);
     const DASHBOARD_MAIN_TABS = new Set(['status', 'cluster', 'settings', 'models', 'logs', 'bench']);
-    const DASHBOARD_SETTINGS_TABS = new Set(['global', 'integrations', 'models']);
+    const DASHBOARD_SETTINGS_TABS = new Set(['global', 'integrations', 'models', 'theme']);
     const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader', 'quantizer', 'uploader']);
     const DASHBOARD_BENCH_TABS = new Set(['throughput', 'accuracy', 'context']);
     const DASHBOARD_DOWNLOADER_SOURCES = new Set(['hf', 'ms', 'recommended']);
@@ -115,7 +115,8 @@
         generated_tokens: { label: 'status.stat.generated_tokens', field: 'total_completion_tokens' },
     };
     // Static class strings so Tailwind keeps them; indexed by tile count.
-    const SERVING_STAT_GRID_CLASSES = ['', '', 'sm:grid-cols-2', 'sm:grid-cols-2 lg:grid-cols-3', 'sm:grid-cols-2 lg:grid-cols-4'];
+    // Phones pair the tiles two per row; wider screens step up to three or four.
+    const SERVING_STAT_GRID_CLASSES = ['', 'grid-cols-1', 'grid-cols-2', 'grid-cols-2 lg:grid-cols-3', 'grid-cols-2 lg:grid-cols-4'];
     // Accuracy bench presets: benchmark -> samples, where 0 is the full
     // dataset. `standard` is the default selection; `full` is built from the
     // catalogue.
@@ -137,6 +138,24 @@
             activeTheme: 'light', // Will be updated by applyTheme
             systemThemeListener: null,
             enhancedReadability: localStorage.getItem(ENHANCED_READABILITY_KEY) === 'on',
+            // Script tests load this file without custom_theme.js, hence the fallbacks.
+            customThemeGroups: window.OmlxCustomTheme?.GROUPS ?? [],
+            customThemeStored: window.OmlxCustomTheme?.sanitize(window._customTheme) ?? { light: {}, dark: {} },
+            customThemeDefaults: { light: {}, dark: {} },
+            customThemeDraft: { light: {}, dark: {} },
+            customThemeSaving: false,
+            customThemeSaved: false,
+            customThemeError: '',
+            customThemeJson: '',
+            customThemeJsonError: '',
+            themeImageError: '',
+            themeImageBusy: false,
+            customThemeJsonCopied: false,
+            customThemeJsonCopyBlocked: false,
+            showCustomThemeRestoreConfirm: false,
+            _customThemeSavedTimer: null,
+            _customThemeJsonCopiedTimer: null,
+            _customThemeReady: false,
 
             // Global settings section rail
             settingsActiveSection: 'settings-language',
@@ -164,7 +183,7 @@
                 server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true, distributed_inference_enabled: false, distributed_inference_active: false, max_audio_upload_size: '100MB' },
                 model: { model_dirs: [''], model_fallback: false, hide_helper_models: false },
                 memory: { prefill_memory_guard: true, memory_guard_tier: 'balanced', memory_guard_custom_ceiling_gb: 0 },
-                scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false, prefill_priority: 'context', decode_fairness: true },
+                scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false, prefill_priority: 'context', concurrent_priority: 'balanced' },
                 cache: { enabled: true, ssd_cache_dir: '', ssd_cache_unavailable: false, ssd_cache_max_size: 'auto', hot_cache_max_size: '0', hot_cache_write_through: false, ane_compile_cache: false, initial_cache_blocks: 256, hot_cache_only: false, gdn_snapshot_storage: 'auto', gdn_ssd_split_enabled: true, gdn_ssd_pending_max_size: '512MB', gdn_sidecar_precision: 'fp32' },
                 sampling: { max_context_window: 32768, max_context_window_policy: null, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
                 mcp: { config_path: '', expose_tools: true },
@@ -333,6 +352,12 @@
                 allowCpuSharedResource: true,
             },
             _aneTuningPollTimer: null,
+            // Prefill Accelerator: paired Macs that can help the open model,
+            // and its helper status (polled while the modal is open).
+            prefillHelper: { modelId: null, candidates: [], loading: false, status: null, busy: false, original: null, applied: false },
+            _prefillHelperPollTimer: null,
+            // Set while this Mac runs another Mac's prefill helper.
+            prefillLending: null,
 
             // Profile / template / preset state
             profiles: [],                // per-model profiles for selectedModel
@@ -791,6 +816,7 @@
                 this.fetchClaudeDesktopStatus();
 
                 this.startUpdateCheckTimer();
+                this.pollPrefillLending();
 
                 this.onboardingStartedEmpty = !this.hasUserModels;
                 if (this.onboardingStartedEmpty
@@ -932,6 +958,7 @@
 
                 this.mainTab = DASHBOARD_MAIN_TABS.has(mainTab) ? mainTab : 'status';
                 this.activeTab = DASHBOARD_SETTINGS_TABS.has(settingsTab) ? settingsTab : 'global';
+                if (this.activeTab === 'theme') this.initCustomThemeEditor();
                 this.modelsTab = DASHBOARD_MODELS_TABS.has(modelsTab) ? modelsTab : 'manager';
                 this.benchTab = DASHBOARD_BENCH_TABS.has(benchTab) ? benchTab : 'throughput';
                 const source = params.get('source');
@@ -1027,6 +1054,7 @@
                 if (!DASHBOARD_SETTINGS_TABS.has(tab)) return;
                 this.activeTab = tab;
                 this.mainTab = 'settings';
+                if (tab === 'theme') this.initCustomThemeEditor();
                 this.syncTabStateToUrl();
             },
 
@@ -1375,7 +1403,7 @@
             },
 
             async saveGlobalSettings() {
-                if (this.resettingGlobalSettings) return;
+                if (this.saving || this.resettingGlobalSettings) return;
                 this.saving = true;
                 this.saveSuccess = false;
                 this.saveError = '';
@@ -1449,7 +1477,7 @@
                             embedding_batch_size: this.globalSettings.scheduler.embedding_batch_size,
                             chunked_prefill: this.globalSettings.scheduler.chunked_prefill,
                             prefill_priority: this.globalSettings.scheduler.prefill_priority,
-                            decode_fairness: this.globalSettings.scheduler.decode_fairness,
+                            concurrent_priority: this.globalSettings.scheduler.concurrent_priority,
                             cache_enabled: this.globalSettings.cache.enabled,
                             ssd_cache_dir: this.globalSettings.cache.ssd_cache_dir,
                             ssd_cache_max_size: this.globalSettings.cache.ssd_cache_max_size,
@@ -1701,6 +1729,25 @@
                 }
             },
 
+            async abortRequest(modelId, requestId) {
+                try {
+                    const response = await fetch(
+                        `/admin/api/models/${encodeURIComponent(modelId)}/requests/${encodeURIComponent(requestId)}/abort`,
+                        { method: 'POST' },
+                    );
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                    } else if (!response.ok && response.status !== 404) {
+                        // 404 means the request finished before the click landed.
+                        const data = await response.json();
+                        alert(data.detail || window.t('js.error.stop_request_failed'));
+                    }
+                } catch (err) {
+                    console.error('Failed to stop request:', err);
+                    alert(window.t('js.error.stop_request_failed'));
+                }
+            },
+
             // ===== Profiles / Templates =====
             formValuesForProfile() {
                 const ms = this.modelSettings;
@@ -1711,6 +1758,8 @@
                     if (k === 'enable_thinking' && this.selectedModel?.thinking_forced) continue;
                     if (k === 'chat_template_kwargs' || k === 'forced_ct_kwargs') continue;  // handle below
                     if (isDiffusion && this.isDiffusionUnsupportedProfileField(k)) continue;
+                    // A hidden A8 toggle stays unset rather than saved.
+                    if (k.startsWith('a8_prefill_') && !this.showsA8Prefill(this.selectedModel)) continue;
                     if (k === 'thinking_budget_enabled') {
                         if (ms.enableThinkingBudget) out.thinking_budget_enabled = true;
                         continue;
@@ -2156,8 +2205,12 @@
                         model?.qwen4_ple_ssd_offload_supported === true,
                     qwen4_ple_ssd_offload_forced:
                         model?.qwen4_ple_ssd_offload_forced === true,
+                    prefill_helper_supported: model?.prefill_helper_supported === true,
+                    prefill_helper_node_id: s.prefill_helper_node_id || '',
+                    prefill_helper_layers: s.prefill_helper_layers ? String(s.prefill_helper_layers) : '',
+                    // Unset means on; only a saved false is off.
                     deepseek_v41_ced_prefill_enabled:
-                        s.deepseek_v41_ced_prefill_enabled === true,
+                        s.deepseek_v41_ced_prefill_enabled !== false,
                     deepseek_v41_ced_prefill_supported:
                         String(model?.config_model_type || '').toLowerCase().replaceAll('-', '_') === 'deepseek_v41',
                     qwen4_gdn_decode_wide_proj:
@@ -3031,10 +3084,274 @@
                 }
                 this._modelSettingsBaseline = JSON.stringify(this.modelSettings);
                 this.showModelSettingsModal = true;
+                if (!preservingEdits) this.openPrefillHelper(model);
                 // Sync on the next frame: sections have no layout until the dialog opens.
                 this.$nextTick(() => {
                     if (this.$refs.modelSettingsBody) this.modelSettingsOnScroll(this.$refs.modelSettingsBody);
                 });
+            },
+
+            async pollPrefillLending() {
+                if (this.globalSettings.server.distributed_inference_active && !document.hidden) {
+                    try {
+                        const resp = await fetch('/admin/api/prefill-helper/lending');
+                        if (resp.ok) {
+                            const data = await resp.json();
+                            this.prefillLending = data.active ? data : null;
+                        }
+                    } catch (_) { /* network error */ }
+                } else if (!this.globalSettings.server.distributed_inference_active) {
+                    this.prefillLending = null;
+                }
+                setTimeout(() => this.pollPrefillLending(), 5000);
+            },
+
+            async stopPrefillLending() {
+                try {
+                    await fetch('/admin/api/prefill-helper/lending/stop', { method: 'POST' });
+                } catch (_) { /* network error */ }
+                this.prefillLending = null;
+            },
+
+            prefillLendingText() {
+                const lending = this.prefillLending;
+                if (!lending) return '';
+                return window.t('dashboard.prefill_lending')
+                    .replaceAll('{host}', lending.host || '?')
+                    .replace('{n}', lending.layers ?? '')
+                    .replace('{model}', String(lending.model || '').split('/').pop());
+            },
+
+            openPrefillHelper(model) {
+                if (this._prefillHelperPollTimer) {
+                    clearTimeout(this._prefillHelperPollTimer);
+                    this._prefillHelperPollTimer = null;
+                }
+                this.prefillHelper = {
+                    modelId: model.id,
+                    candidates: [],
+                    loading: false,
+                    status: model.prefill_helper || null,
+                    busy: false,
+                    original: {
+                        prefill_helper_node_id: model.settings?.prefill_helper_node_id || null,
+                        prefill_helper_layers: model.settings?.prefill_helper_layers ?? null,
+                    },
+                    applied: false,
+                    checked: false,
+                };
+                if (!model.prefill_helper_supported
+                    || !this.globalSettings.server.distributed_inference_active) return;
+                this.loadPrefillHelperCandidates();
+                this.pollPrefillHelper();
+            },
+
+            async loadPrefillHelperCandidates() {
+                const modelId = this.prefillHelper.modelId;
+                this.prefillHelper.loading = true;
+                try {
+                    const resp = await fetch(
+                        '/admin/api/prefill-helper/candidates?model_id=' + encodeURIComponent(modelId)
+                    );
+                    if (resp.ok && this.prefillHelper.modelId === modelId) {
+                        const data = await resp.json();
+                        this.prefillHelper.candidates = data.devices || [];
+                    }
+                } catch (_) { /* network error */ }
+                if (this.prefillHelper.modelId === modelId) this.prefillHelper.loading = false;
+            },
+
+            async pollPrefillHelper() {
+                const modelId = this.prefillHelper.modelId;
+                if (!this.showModelSettingsModal || this.selectedModel?.id !== modelId) {
+                    this._prefillHelperPollTimer = null;
+                    return;
+                }
+                try {
+                    const resp = await fetch(
+                        '/admin/api/prefill-helper/models/' + encodeURIComponent(modelId)
+                    );
+                    if (resp.ok && this.prefillHelper.modelId === modelId) {
+                        this.prefillHelper.status = await resp.json();
+                        // A saved helper of an unloaded model: see whether its
+                        // files are already there (nothing is copied).
+                        if (this.prefillHelper.status.state === 'unloaded'
+                            && this.selectedModel?.settings?.prefill_helper_node_id
+                            && !this.prefillHelper.checked) {
+                            this.prefillHelper.checked = true;
+                            this.prefillHelperAction('check');
+                        }
+                    }
+                } catch (_) { /* network error */ }
+                this._prefillHelperPollTimer = setTimeout(() => this.pollPrefillHelper(), 2000);
+            },
+
+            async prefillHelperAction(action) {
+                const modelId = this.prefillHelper.modelId;
+                this.prefillHelper.busy = true;
+                try {
+                    const resp = await fetch(
+                        '/admin/api/prefill-helper/models/' + encodeURIComponent(modelId) + '/' + action,
+                        { method: 'POST' }
+                    );
+                    if (resp.ok && this.prefillHelper.modelId === modelId) {
+                        this.prefillHelper.status = await resp.json();
+                    }
+                } catch (_) { /* network error */ }
+                this.prefillHelper.busy = false;
+            },
+
+            prefillHelperCandidate(nodeId) {
+                return this.prefillHelper.candidates.find((d) => d.node_id === nodeId) || null;
+            },
+
+            prefillHelperUsable(device) {
+                return device.online && device.version_ok && device.layers_fit > 0;
+            },
+
+            prefillHelperOption(device) {
+                const parts = [device.name];
+                if (device.chip) parts.push(device.chip + (device.ram_gb ? ` ${device.ram_gb} GB` : ''));
+                if (!device.online) {
+                    parts.push(window.t('modal.model_settings.prefill_helper_offline'));
+                } else if (!device.version_ok) {
+                    parts.push(window.t('modal.model_settings.prefill_helper_update'));
+                } else if (device.layers_fit > 0) {
+                    parts.push(window.t('modal.model_settings.prefill_helper_fits')
+                        .replace('{n}', device.layers_fit));
+                } else {
+                    parts.push(window.t('modal.model_settings.prefill_helper_no_memory'));
+                }
+                return parts.join(' · ');
+            },
+
+            prefillHelperPending() {
+                const saved = this.selectedModel?.settings || {};
+                const ms = this.modelSettings;
+                return (saved.prefill_helper_node_id || '') !== (ms.prefill_helper_node_id || '')
+                    || String(saved.prefill_helper_layers || '') !== String(ms.prefill_helper_layers || '');
+            },
+
+            // Applies the helper choice without closing the dialog, so its
+            // progress and the Copy files step show here.
+            async applyPrefillHelper() {
+                const model = this.selectedModel;
+                const ms = this.modelSettings;
+                if (!model) return;
+                const body = {
+                    prefill_helper_node_id: ms.prefill_helper_node_id || null,
+                    prefill_helper_layers: ms.prefill_helper_node_id && ms.prefill_helper_layers
+                        ? parseInt(ms.prefill_helper_layers, 10)
+                        : null,
+                };
+                this.prefillHelper.busy = true;
+                try {
+                    const resp = await fetch(`/admin/api/models/${encodeURIComponent(model.id)}/settings`, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(body),
+                    });
+                    if (resp.ok) {
+                        model.settings = { ...(model.settings || {}), ...body };
+                        this.prefillHelper.applied = true;
+                    } else if (resp.status === 401) {
+                        window.location.href = '/admin';
+                    } else {
+                        const data = await resp.json().catch(() => ({}));
+                        alert(typeof data.detail === 'string' ? data.detail : window.t('js.error.save_model_settings_failed'));
+                    }
+                } catch (_) {
+                    alert(window.t('js.error.save_model_settings_failed'));
+                }
+                this.prefillHelper.busy = false;
+            },
+
+            // Cancel undoes an applied helper choice; Save keeps it.
+            closeModelSettings() {
+                this.showModelSettingsModal = false;
+                const model = this.selectedModel;
+                const body = this.prefillHelper.original;
+                if (!this.prefillHelper.applied || !model || !body) return;
+                this.prefillHelper.applied = false;
+                fetch(`/admin/api/models/${encodeURIComponent(model.id)}/settings`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                }).then((resp) => {
+                    if (resp.ok) model.settings = { ...(model.settings || {}), ...body };
+                }).catch(() => { /* network error */ });
+            },
+
+            prefillHelperTakeoverText(device) {
+                if (!device?.lending) return '';
+                return window.t('modal.model_settings.prefill_helper_takes_over')
+                    .replaceAll('{name}', device.name || '')
+                    .replaceAll('{host}', device.lending.host || '?')
+                    .replaceAll('{model}', device.lending.model || '?');
+            },
+
+            prefillHelperLayerChoices() {
+                const device = this.prefillHelperCandidate(this.modelSettings.prefill_helper_node_id);
+                const most = Math.max(
+                    device?.layers_fit || 0,
+                    parseInt(this.modelSettings.prefill_helper_layers, 10) || 0,
+                );
+                return Array.from({ length: most }, (_, i) => i + 1);
+            },
+
+            prefillHelperStatusText() {
+                const s = this.prefillHelper.status;
+                const t = (key) => window.t('modal.model_settings.prefill_helper_state_' + key);
+                if (!s) return t('unloaded');
+                const name = s.name || this.prefillHelperCandidate(s.node_id)?.name || '';
+                const size = (n) => this.formatSizeBytes(Number(n || 0));
+                switch (s.state) {
+                    case 'connecting':
+                        return t('connecting').replace('{name}', name);
+                    case 'starting':
+                        return t('starting').replace('{name}', name).replace('{n}', s.layers ?? '');
+                    case 'needs_files':
+                        return t(s.prompt).replace('{name}', name).replace('{size}', size(s.bytes))
+                            .replace('{left}', size(s.left))
+                            .replace('{copies}', (s.delete || []).map((c) => c.name + ' (' + size(c.bytes) + ')').join(', '));
+                    case 'copying': {
+                        const text = t('copying').replace('{name}', name).replace('{done}', size(s.done))
+                            .replace('{size}', size(s.bytes));
+                        if (s.seconds_left == null) return text;
+                        const left = s.seconds_left < 90
+                            ? t('seconds_left').replace('{n}', s.seconds_left)
+                            : t('minutes_left').replace('{n}', Math.ceil(s.seconds_left / 60));
+                        return text + ' · ' + left;
+                    }
+                    case 'files_ready':
+                        return t('files_ready').replace('{name}', name).replace('{n}', s.held ?? '')
+                            + (this.prefillHelper.applied ? ' ' + t('save_keeps') : '');
+                    case 'files_missing':
+                        return t('files_missing').replace('{name}', name).replace('{n}', s.held ?? '')
+                            .replace('{size}', size(s.bytes));
+                    case 'ready':
+                    case 'working': {
+                        // No split beats this Mac alone over the measured link.
+                        if (s.layers === 0) return t('slow_link').replace('{name}', name);
+                        let text = t(s.state).replace('{name}', name).replace('{n}', s.held ?? '');
+                        if (s.last_prompt) {
+                            text += ' · ' + t('last_prompt')
+                                .replace('{tokens}', Number(s.last_prompt.tokens).toLocaleString())
+                                .replace('{seconds}', Number(s.last_prompt.seconds).toFixed(1));
+                        }
+                        return text;
+                    }
+                    case 'offline':
+                        return t('offline').replace('{name}', name).replace('{reason}', s.reason || '');
+                    case 'stopped':
+                        return s.reason ? s.reason + '.' : t('stopped');
+                    case 'error':
+                        return s.reason || t('error');
+                    case 'unloaded':
+                        return t('unloaded');
+                    default:
+                        return '';
+                }
             },
 
             async importMtplxSidecar() {
@@ -3072,18 +3389,19 @@
 
             isA8PrefillModel(model) {
                 const type = String(model?.config_model_type || '').toLowerCase().replaceAll('-', '_');
-                // qwen4_exp (Qwen3.8-Flash-Next) and deepseek_v41 are exact
-                // matches: only those validated families have routed-expert A8.
-                return type === 'qwen4_exp' || type === 'deepseek_v41'
+                // Exact matches: only these validated families have routed-expert A8.
+                return ['qwen4_exp', 'deepseek_v41', 'minimax_m3', 'minimax_m3_vl'].includes(type)
                     || ['qwen3_5', 'qwen3_6', 'qwen3_8'].some(prefix => type.startsWith(prefix));
             },
 
-            // The kernels need native INT8 tensor ops (M5-series or newer).
-            // A saved "on" keeps the toggle so it can be turned off.
+            // The kernels need native INT8 tensor ops (M5-series or newer),
+            // here or on the Prefill Accelerator Mac. A saved "on" keeps the
+            // toggle so it can be turned off.
             showsA8Prefill(model) {
                 return this.isA8PrefillModel(model)
                     && (model?.a8_prefill_supported === true
-                        || model?.settings?.a8_prefill_enabled === true);
+                        || model?.settings?.a8_prefill_enabled === true
+                        || !!this.modelSettings?.prefill_helper_node_id);
             },
 
             validateGpuPowerLimit() {
@@ -3096,7 +3414,8 @@
             },
 
             validateA8PrefillSettings() {
-                if (!this.modelSettings.a8_prefill_enabled) return null;
+                if (!this.modelSettings.a8_prefill_enabled
+                    || !this.showsA8Prefill(this.selectedModel)) return null;
                 // Both wrap the same MLP call, so the combination silently
                 // disables one of them. Caught here so the modal explains it
                 // instead of surfacing the server's 400.
@@ -3239,8 +3558,10 @@
                         ms.qwen4_ple_ssd_offload_forced
                             ? !!ms.qwen4_ple_ssd_offload_requested
                             : !!ms.qwen4_ple_ssd_offload,
-                    deepseek_v41_ced_prefill_enabled:
-                        !!ms.deepseek_v41_ced_prefill_enabled,
+                    prefill_helper_node_id: ms.prefill_helper_node_id || null,
+                    prefill_helper_layers: ms.prefill_helper_node_id && ms.prefill_helper_layers
+                        ? parseInt(ms.prefill_helper_layers, 10)
+                        : null,
                     qwen4_gdn_decode_wide_proj:
                         !!ms.qwen4_gdn_decode_wide_proj,
                     activation_fp16_enabled: !!ms.activation_fp16_enabled,
@@ -3275,8 +3596,6 @@
                         : 4,
                     moe_expert_offload_enabled: !isDiffusion && this.selectedModel?.moe_expert_offload_supported === true && !!ms.moe_expert_offload_enabled,
                     moe_expert_offload_resident_fraction: ms.moe_expert_offload_resident_fraction ?? 0.25,
-                    a8_prefill_enabled: !!ms.a8_prefill_enabled,
-                    a8_prefill_min_tokens: Number(ms.a8_prefill_min_tokens) || 128,
                     qwen35_ane_prefill_enabled: !!ms.qwen35_ane_prefill_enabled,
                     // Validation only runs when the feature is enabled, so a
                     // blank numeric input must fall back to the server default
@@ -3351,6 +3670,14 @@
                     trust_remote_code: ms.trust_remote_code,
                     external_engine: ms.external_engine || null,
                 };
+                // Sent only where the toggle shows, so a hidden setting stays unset.
+                if (ms.deepseek_v41_ced_prefill_supported) {
+                    payload.deepseek_v41_ced_prefill_enabled = !!ms.deepseek_v41_ced_prefill_enabled;
+                }
+                if (this.showsA8Prefill(this.selectedModel)) {
+                    payload.a8_prefill_enabled = !!ms.a8_prefill_enabled;
+                    payload.a8_prefill_min_tokens = Number(ms.a8_prefill_min_tokens) || 128;
+                }
                 if (isDiffusion) {
                     Object.assign(payload, {
                         top_p: null,
@@ -3418,6 +3745,7 @@
             },
 
             async saveModelSettings() {
+                if (this.savingModelSettings) return;
                 if (!this.selectedModel) return;
 
                 const a8PrefillValidationError = this.validateA8PrefillSettings();
@@ -3464,6 +3792,7 @@
                         // Refresh the model list to update badges
                         await this.loadModels();
                         const data = await response.json();
+                        this.prefillHelper.applied = false;
                         this.showModelSettingsModal = false;
                         if (data.requires_reload) {
                             if (data.auto_reloaded) {
@@ -3907,6 +4236,17 @@
             },
 
             get claudeCodeCommand() {
+                return this._claudeCodeCommand(this.stats.api_key);
+            },
+
+            // On-screen variant with the auth token masked (sub-key style), so
+            // the rendered dashboard never exposes the API key; the copy
+            // button still copies the real claudeCodeCommand.
+            get claudeCodeCommandDisplay() {
+                return this._claudeCodeCommand(this.stats.api_key ? '••••••••' : '');
+            },
+
+            _claudeCodeCommand(authToken) {
                 const mode = this.globalSettings.claude_code.mode;
                 if (mode === 'cloud') {
                     return 'env -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_DEFAULT_OPUS_MODEL -u ANTHROPIC_DEFAULT_SONNET_MODEL -u ANTHROPIC_DEFAULT_HAIKU_MODEL -u API_TIMEOUT_MS -u CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC claude';
@@ -3918,8 +4258,8 @@
                 const haikuModel = this.globalSettings.claude_code.haiku_model || 'select-a-model';
                 const parts = [];
                 parts.push(this.shellEnvAssign('ANTHROPIC_BASE_URL', `http://${this.displayHost}:${port}`));
-                if (this.stats.api_key) {
-                    parts.push(this.shellEnvAssign('ANTHROPIC_AUTH_TOKEN', this.stats.api_key));
+                if (authToken) {
+                    parts.push(this.shellEnvAssign('ANTHROPIC_AUTH_TOKEN', authToken));
                 }
                 parts.push(this.shellEnvAssign('ANTHROPIC_DEFAULT_OPUS_MODEL', opusModel));
                 parts.push(this.shellEnvAssign('ANTHROPIC_DEFAULT_SONNET_MODEL', sonnetModel));
@@ -4824,11 +5164,12 @@
 
             get activeModelsPressureBarColor() {
                 const pct = this.activeModelsPressurePercent;
-                if (pct >= 90) return 'rgb(var(--palette-red-500))';
-                if (pct >= 80) return 'rgb(var(--palette-orange-500))';
-                if (pct >= 70) return 'rgb(var(--palette-amber-500))';
-                if (pct >= 60) return 'rgb(var(--palette-yellow-400))';
-                return 'rgb(var(--palette-green-500))';
+                if (pct >= 90) return 'var(--danger)';
+                // custom_theme.js sets --meter-high/--meter-mid only for custom status roles.
+                if (pct >= 80) return 'var(--meter-high, rgb(var(--palette-orange-500)))';
+                if (pct >= 70) return 'var(--warning)';
+                if (pct >= 60) return 'var(--meter-mid, rgb(var(--palette-yellow-400)))';
+                return 'var(--success)';
             },
 
             get activeModelsPressureBarStyle() {
@@ -7068,6 +7409,371 @@
                 } else {
                     document.documentElement.removeAttribute('data-enhanced-readability');
                 }
+            },
+
+            // =================================================================
+            // Custom theme
+            // =================================================================
+            initCustomThemeEditor() {
+                if (this._customThemeReady) return;
+                this._customThemeReady = true;
+                this.customThemeDefaults = window.OmlxCustomTheme.defaults();
+                this.fillCustomThemeDraft();
+            },
+
+            fillCustomThemeDraft(theme = this.customThemeStored) {
+                const draft = { light: {}, dark: {} };
+                for (const mode of ['light', 'dark']) {
+                    for (const token of window.OmlxCustomTheme.TOKENS) {
+                        draft[mode][token] = theme[mode]?.[token]
+                            || this.customThemeDefaults[mode][token] || '';
+                    }
+                }
+                this.customThemeDraft = draft;
+            },
+
+            get customThemeActive() {
+                return ['light', 'dark'].some(mode => Object.keys(this.customThemeStored[mode]).length > 0);
+            },
+
+            themeTokenValid(mode, token) {
+                return window.OmlxCustomTheme.normalizeHex(this.customThemeDraft[mode]?.[token]) !== null;
+            },
+
+            themeTokenColor(mode, token) {
+                return window.OmlxCustomTheme.normalizeHex(this.customThemeDraft[mode]?.[token])
+                    || this.customThemeDefaults[mode][token] || '#000000';
+            },
+
+            themeTokenChanged(mode, token) {
+                return this.themeTokenColor(mode, token) !== this.customThemeDefaults[mode][token];
+            },
+
+            customThemeOverrides() {
+                const overrides = { light: {}, dark: {} };
+                for (const mode of ['light', 'dark']) {
+                    for (const token of window.OmlxCustomTheme.TOKENS) {
+                        const color = this.themeTokenColor(mode, token);
+                        if (color !== this.customThemeDefaults[mode][token]) overrides[mode][token] = color;
+                    }
+                }
+                return overrides;
+            },
+
+            get customThemeDirty() {
+                return JSON.stringify(this.customThemeOverrides()) !== JSON.stringify(this.customThemeStored);
+            },
+
+            get customThemeInputsValid() {
+                return ['light', 'dark'].every(mode =>
+                    window.OmlxCustomTheme.TOKENS.every(token => this.themeTokenValid(mode, token)))
+                    && this.themeContrastFailures.length === 0;
+            },
+
+            // Column chrome uses stock colors so editing a surface never flips a column.
+            themeModeColor(mode, token) {
+                const stock = this.customThemeDefaults[mode] && this.customThemeDefaults[mode][token];
+                return stock || this.themeTokenColor(mode, token);
+            },
+
+            themeModeHeadStyle(mode) {
+                const color = token => this.themeModeColor(mode, token);
+                return `background:${color('bg-primary')}; border-color:${color('border-normal')}; color:${color('text-secondary')};`;
+            },
+
+            themeModeCellStyle(mode, surface = 'bg-primary') {
+                const color = token => this.themeModeColor(mode, token);
+                return `--theme-cell-bg:${color('bg-primary')}; --theme-cell-fg:${color('text-primary')};`
+                    + ` --theme-cell-border:${color('border-normal')}; --theme-cell-placeholder:${color('text-muted')};`
+                    + ` --theme-cell-surface:${color(surface)}; --theme-cell-line:${color('border-faint')};`
+                    + ` --theme-cell-icon:${color('text-tertiary')}; --theme-cell-icon-hover:${color('text-primary')};`
+                    + ` --theme-cell-hover:${color('bg-tertiary')}; --theme-cell-ring:${color('focus-ring-color')};`;
+            },
+
+            // Tokens plus badge parts as opaque hex; read by the preview and the contrast checks.
+            themeDrawColors(mode) {
+                const api = window.OmlxCustomTheme;
+                const stock = this.customThemeDefaults[mode];
+                const colors = Object.fromEntries(api.TOKENS.map(token => [token, this.themeTokenColor(mode, token)]));
+                const page = colors['bg-primary'];
+                for (const status of api.STATUS) {
+                    const badge = colors[status] === stock[status]
+                        ? Object.fromEntries(['soft', 'line', 'text'].map(part => [part, api.flatten(stock[`${status}-${part}`], page)]))
+                        : api.badgeColors(mode, colors[status], page);
+                    for (const [part, color] of Object.entries(badge)) colors[`${status}-${part}`] = color;
+                }
+                return colors;
+            },
+
+            // The only contrast check: the server stores any #rrggbb it gets.
+            themeContrastChecks(mode) {
+                return window.OmlxCustomTheme.contrastChecks(this.themeDrawColors(mode));
+            },
+
+            // The lowest failing pair per foreground, in both modes, with the token to fix.
+            get themeContrastFailures() {
+                return ['light', 'dark'].flatMap(mode => {
+                    const lowest = {};
+                    for (const check of this.themeContrastChecks(mode)) {
+                        if (!check.ok && !(lowest[check.foreground]?.ratio <= check.ratio)) lowest[check.foreground] = check;
+                    }
+                    // A status badge's text is derived; its status color is the field to change.
+                    const field = token => window.OmlxCustomTheme.STATUS.find(status => token === `${status}-text`) || token;
+                    return Object.values(lowest).map(check => ({ ...check, mode, token: field(check.foreground) }));
+                });
+            },
+
+            themeContrastLabel(token) {
+                const status = token.match(/^(\w+)-(soft|text)$/);
+                if (status && window.OmlxCustomTheme.STATUS.includes(status[1])) {
+                    return window.t(`settings.theme.contrast.badge_${status[2]}`)
+                        .replace('{status}', window.t(`settings.theme.token.${status[1]}`));
+                }
+                return window.t(`settings.theme.token.${token}`);
+            },
+
+            themeContrastMessage(failure) {
+                return window.t('settings.theme.contrast.pair')
+                    .replace('{mode}', window.t(`settings.theme.${failure.mode}`))
+                    .replace('{foreground}', this.themeContrastLabel(failure.foreground))
+                    .replace('{background}', this.themeContrastLabel(failure.background))
+                    .replace('{ratio}', failure.ratio.toFixed(2))
+                    .replace('{floor}', String(failure.floor));
+            },
+
+            themeTokenFlagged(mode, token) {
+                return !this.themeTokenValid(mode, token) || this.themeContrastFailures
+                    .some(failure => failure.mode === mode && failure.token === token);
+            },
+
+            normalizeThemeInput(mode, token) {
+                const text = String(this.customThemeDraft[mode][token] ?? '').trim();
+                if (!text) {
+                    this.customThemeDraft[mode][token] = this.customThemeDefaults[mode][token];
+                    return;
+                }
+                const hex = window.OmlxCustomTheme.normalizeHex(text);
+                if (hex) this.customThemeDraft[mode][token] = hex;
+            },
+
+            resetThemeToken(mode, token) {
+                this.customThemeDraft[mode][token] = this.customThemeDefaults[mode][token];
+            },
+
+            // Redrawn by x-effect whenever a color it reads changes, and on resize.
+            drawThemePreview(canvas, mode) {
+                const preview = window.OmlxThemePreview;
+                if (!canvas._resize) {
+                    canvas._resize = new ResizeObserver(() => this.drawThemePreview(canvas, mode));
+                    canvas._resize.observe(canvas);
+                }
+                const status = Object.fromEntries(window.OmlxCustomTheme.STATUS.map(name => [name, window.t(`settings.theme.token.${name}`)]));
+                canvas._regions = preview.drawPreview(canvas, this.themeDrawColors(mode), {
+                    mode,
+                    sans: getComputedStyle(document.body).fontFamily,
+                    hover: canvas._hover,
+                    labels: {
+                        ...preview.LABELS,
+                        version: canvas.dataset.version,
+                        heading: window.t('settings.theme.heading'),
+                        subtitle: window.t('settings.theme.preview_subtitle'),
+                        port: window.t('settings.theme.preview_port'),
+                        link: window.t('settings.theme.preview_link'),
+                        danger: window.t('settings.theme.preview_danger'),
+                        hover: window.t('settings.theme.preview_hover'),
+                        save: window.t('settings.save.button'),
+                        tabStatus: window.t('navbar.tab.status'),
+                        tabSettings: window.t('navbar.tab.settings'),
+                        status,
+                    },
+                });
+            },
+
+            themePreviewRegion(canvas, event) {
+                const scale = window.OmlxThemePreview.CARD_W / canvas.clientWidth;
+                return window.OmlxThemePreview.regionAt(canvas._regions || [], event.offsetX * scale, event.offsetY * scale);
+            },
+
+            hoverThemePreview(canvas, mode, event) {
+                const region = event && this.themePreviewRegion(canvas, event);
+                if (region === canvas._hover) return;
+                canvas._hover = region;
+                canvas.style.cursor = region ? 'pointer' : '';
+                this.drawThemePreview(canvas, mode);
+            },
+
+            focusThemeToken(mode, event) {
+                const token = this.themePreviewRegion(event.currentTarget, event)?.[4];
+                const field = token && document.getElementById(`theme-token-${mode}-${token}`);
+                if (!field) return;
+                field.focus();
+                field.select();
+            },
+
+            async saveCustomTheme(overrides) {
+                const api = window.OmlxCustomTheme;
+                const theme = api.sanitize(overrides);
+                this.customThemeSaving = true;
+                this.customThemeError = '';
+                this.customThemeSaved = false;
+                try {
+                    const response = await fetch('/admin/api/global-settings', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ ui_custom_theme: api.isEmpty(theme) ? null : theme }),
+                    });
+                    if (!response.ok) throw new Error(await response.text() || response.statusText);
+                    const clean = api.apply(theme);
+                    this.customThemeStored = clean;
+                    window._customTheme = api.isEmpty(clean) ? null : clean;
+                    this.fillCustomThemeDraft();
+                    return true;
+                } catch (error) {
+                    this.customThemeError = window.t('settings.theme.save_failed');
+                    console.error('Failed to save custom theme:', error);
+                    return false;
+                } finally {
+                    this.customThemeSaving = false;
+                }
+            },
+
+            async applyCustomTheme() {
+                if (!this.customThemeInputsValid) return;
+                if (!(await this.saveCustomTheme(this.customThemeOverrides()))) return;
+                this.customThemeSaved = true;
+                clearTimeout(this._customThemeSavedTimer);
+                this._customThemeSavedTimer = setTimeout(() => { this.customThemeSaved = false; }, 2500);
+            },
+
+            discardCustomThemeDraft() {
+                this.customThemeError = '';
+                this.fillCustomThemeDraft();
+            },
+
+            // Fills the dark fields only; Apply still runs the contrast check.
+            generateDarkCustomTheme() {
+                const api = window.OmlxCustomTheme;
+                const light = Object.fromEntries(api.TOKENS.map(token => [token, this.themeTokenColor('light', token)]));
+                this.customThemeDraft.dark = api.darkFromLight(light);
+            },
+
+            // The full palette, so an agent sees every token, not only the overrides.
+            async copyCustomThemeJson() {
+                const theme = { light: {}, dark: {} };
+                for (const mode of ['light', 'dark']) {
+                    for (const token of window.OmlxCustomTheme.TOKENS) {
+                        theme[mode][token] = this.themeTokenColor(mode, token);
+                    }
+                }
+                this.customThemeJson = JSON.stringify(theme, null, 2);
+                this.customThemeJsonError = '';
+                this.customThemeJsonCopied = false;
+                this.customThemeJsonCopyBlocked = false;
+                try {
+                    await navigator.clipboard.writeText(this.customThemeJson);
+                    this.customThemeJsonCopied = true;
+                    clearTimeout(this._customThemeJsonCopiedTimer);
+                    this._customThemeJsonCopiedTimer = setTimeout(() => { this.customThemeJsonCopied = false; }, 2000);
+                } catch (error) {
+                    // Plain-http LAN access has no clipboard; leave the JSON selected instead.
+                    console.debug('Clipboard unavailable:', error);
+                    this.customThemeJsonCopyBlocked = true;
+                    this.$nextTick(() => {
+                        this.$refs.customThemeJsonField.focus();
+                        this.$refs.customThemeJsonField.select();
+                    });
+                }
+            },
+
+            // Fills the fields only; Apply still runs the contrast check.
+            async loadThemeImage(event) {
+                const file = event.target.files?.[0];
+                event.target.value = '';
+                if (!file) return;
+                const preview = window.OmlxThemePreview;
+                const api = window.OmlxCustomTheme;
+                this.themeImageError = '';
+                let theme = null;
+                try {
+                    theme = api.sanitize(JSON.parse(preview.readTextChunk(new Uint8Array(await file.arrayBuffer()), preview.KEYWORD)));
+                } catch (error) {
+                    console.debug('No theme in the image:', error);
+                }
+                if (!theme || api.isEmpty(theme)) {
+                    this.themeImageError = window.t('settings.theme.image_no_theme');
+                    return;
+                }
+                this.fillCustomThemeDraft(theme);
+            },
+
+            async saveThemePreviewImage(version) {
+                if (this.themeImageBusy) return;
+                this.themeImageError = '';
+                this.themeImageBusy = true;
+                try {
+                    // The image uses Inter in every UI language, so load it before drawing.
+                    if (document.fonts?.load) {
+                        await Promise.all([300, 400, 500, 600, 700, 800].map(weight =>
+                            document.fonts.load(`${weight} 11px Inter`).catch(() => {})));
+                    }
+                    if (document.fonts?.ready) await document.fonts.ready;
+                    const blob = await window.OmlxThemePreview.png({
+                        theme: { light: this.themeDrawColors('light'), dark: this.themeDrawColors('dark') },
+                        groups: window.OmlxCustomTheme.GROUPS,
+                        version,
+                    });
+                    const link = document.createElement('a');
+                    const now = new Date();
+                    const pad = value => String(value).padStart(2, '0');
+                    const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}${pad(now.getHours())}${pad(now.getMinutes())}`;
+                    link.href = URL.createObjectURL(blob);
+                    link.download = `omlx-theme-${stamp}.png`;
+                    document.body.appendChild(link);
+                    link.click();
+                    link.remove();
+                    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+                } catch (error) {
+                    console.error('Failed to save the theme image:', error);
+                    this.themeImageError = window.t('settings.theme.image_failed');
+                } finally {
+                    this.themeImageBusy = false;
+                }
+            },
+
+            // Overwrites only the tokens in the JSON; Apply still runs the contrast check.
+            importCustomThemeJson() {
+                const api = window.OmlxCustomTheme;
+                let clean;
+                try {
+                    clean = api.sanitize(JSON.parse(this.customThemeJson));
+                } catch (error) {
+                    clean = { light: {}, dark: {} };
+                }
+                if (api.isEmpty(clean)) {
+                    this.customThemeJsonError = window.t('settings.theme.json.invalid');
+                    return;
+                }
+                this.customThemeJsonError = '';
+                this.customThemeJsonCopyBlocked = false;
+                for (const mode of ['light', 'dark']) Object.assign(this.customThemeDraft[mode], clean[mode]);
+            },
+
+            resetCustomTheme() {
+                this.showCustomThemeRestoreConfirm = true;
+            },
+
+            cancelCustomThemeRestore() {
+                this.showCustomThemeRestoreConfirm = false;
+            },
+
+            async confirmCustomThemeRestore() {
+                this.showCustomThemeRestoreConfirm = false;
+                await this.saveCustomTheme(null);
+            },
+
+            openCustomThemeSettings() {
+                this.setSettingsTab('theme');
+                window.scrollTo({ top: 0 });
             },
 
             applyTheme() {

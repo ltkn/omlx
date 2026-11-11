@@ -280,7 +280,7 @@ OpenAI 和 Anthropic API 的直接替代品。支持流式使用统计（`stream
 | 类型 | 模型 |
 |------|------|
 | LLM | [mlx-lm](https://github.com/ml-explore/mlx-lm) 支持的所有模型 |
-| VLM | Qwen3.5 系列、GLM-4V、Pixtral 及其他 [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) 模型 |
+| VLM | Qwen3.5 系列、GLM-4V、Pixtral 及其他 [mlx-vlm](https://github.com/Neywa-Labs/mlx-vlm) 模型 |
 | OCR | DeepSeek-OCR、DOTS-OCR、GLM-OCR |
 | 嵌入 | BERT、BGE-M3、ModernBERT、EmbeddingGemma 2 |
 | 重排序 | ModernBERT、XLM-RoBERTa |
@@ -407,13 +407,15 @@ apps/omlx-mac/Scripts/build.sh release --rebuild-donor
 ## 致谢
 
 - [MLX](https://github.com/ml-explore/mlx) 和 [mlx-lm](https://github.com/ml-explore/mlx-lm) by Apple
-- [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) - Apple Silicon 上的视觉语言模型推理
+- [mlx-vlm](https://github.com/Neywa-Labs/mlx-vlm) - Apple Silicon 上的视觉语言模型推理
 - [vllm-mlx](https://github.com/waybarrios/vllm-mlx) - oMLX 从 vllm-mlx v0.1.0 起步，经过大幅演进，增加了多模型服务、分层 KV 缓存、完整分页缓存支持的 VLM、管理后台和 macOS 菜单栏应用
 - [venvstacks](https://venvstacks.lmstudio.ai) - macOS 应用包的便携 Python 环境分层
 - [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) - Apple Silicon 嵌入模型支持
 - [dflash-mlx](https://github.com/bstnxbt/dflash-mlx) - Apple Silicon 上的块扩散推测解码 (Block diffusion speculative decoding)
 - [MTPLX](https://github.com/youssofal/mtplx) - Lightning MTP 的验证形态 Metal 内核由 Youssof Altoukhi 的 MTPLX 提供支持，同时也启发了 depth-k 流水线设计
-- [mlx-serve](https://github.com/ddalcu/mlx-serve) - 融合 GDN 验证预处理内核改编自 mlx-serve 对 mlxfast-challenge qwen35_packed_gdn_prework 内核的移植，Qwen4 的融合 GDN decode 与 prefill 内核改编自 mlx-serve 的 MIT 开源 `transformer.zig`；Qwen4 QSA 的 128 位 K/V 暂存改编自 mlx-serve 的 MIT 开源 `msv_attn_p256` 内核
-- [Splash](https://github.com/incoai/splash) - 验证形态线性内核采用 Splash 的 bf16 `0x4300 | q` 权重操作数与分组输入求和（来自其 Apache-2.0 开源的 `linear_q4_sgmatrix.metal`），张量运算验证注意力借鉴了 Splash `paged_attention_tile.h` 的分块设计，GGUF 的分词器按照 Splash Apache-2.0 开源的 `install/gguf.py` 从文件头生成
+- [mlx-serve](https://github.com/ddalcu/mlx-serve) - Qwen 的 GDN 与 QSA 内核（其一来自 mlx-serve 对 mlxfast-challenge 的移植）以及 Linux helper 的 expert 内核与 MLX CUDA 补丁改编自 mlx-serve 的 MIT 开源代码
+- [TensorFold](https://github.com/ashhart/TensorFold) - Linux helper 的 MiniMax M3、GLM-5.3、Qwen3.8 Flash-Next 稀疏注意力与 Gated DeltaNet CUDA 内核改编自 TensorFold 的 Apache-2.0 内核
+- [Splash](https://github.com/incoai/splash) - 验证形态的线性与注意力内核以及 GGUF 分词器加载改编自 Splash 的 Apache-2.0 开源代码，Splash 也可作为外部引擎运行模型
 - [SiliconScope](https://github.com/kennss/SiliconScope) - 菜单栏统计信息的设计和渲染方法参考了 Kennt Kim 的 SiliconScope，这也启发了高能效重渲染门禁机制
 - [m5gpu](https://github.com/beamivalice/m5gpu) - GPU 功率限制使用了 beamivalice 的 m5gpu 所记录的 AGX GPU 功率目标（`SetMaxGPUAbsolutePower` 与 `AbsoluteTarget`，以及用于解除的 `-1000`）
+- [ming-tts-serve](https://github.com/sbusso/ming-tts-serve) - Ming-3.0-tts 的流水线解码循环参考了 Stéphane Busso 的 ming-tts-serve，融合 DiT 内核改编自 ming-tts-serve 采用 MIT 许可的 `ming_fused.zig`

@@ -384,16 +384,23 @@ class TestSchedulerSettings:
             "embedding_batch_size": 32,
             "chunked_prefill": False,
             "prefill_priority": "context",
+            "concurrent_priority": "balanced",
             "decode_fairness": True,
         }
 
-    def test_decode_fairness_from_dict(self):
-        """Defaults on; explicit false round-trips."""
-        assert SchedulerSettings.from_dict({}).decode_fairness is True
-        assert (
-            SchedulerSettings.from_dict({"decode_fairness": False}).decode_fairness
-            is False
-        )
+    def test_concurrent_priority_from_dict(self):
+        """Valid values pass through; older files map the on/off switch."""
+
+        def priority(data):
+            return SchedulerSettings.from_dict(data).concurrent_priority
+
+        assert priority({}) == "balanced"
+        assert priority({"decode_fairness": False}) == "prefill"
+        assert priority({"decode_fairness": True}) == "balanced"
+        assert priority({"concurrent_priority": "decode"}) == "decode"
+        assert priority({"concurrent_priority": "fast"}) == "balanced"
+        legacy_off = SchedulerSettings.from_dict({"decode_fairness": False})
+        assert legacy_off.decode_fairness is False
 
     def test_prefill_priority_from_dict(self):
         """Valid values pass through; anything else falls back to context."""
@@ -2281,8 +2288,11 @@ class TestGlobalSettings:
         settings = GlobalSettings()
         settings.scheduler.max_concurrent_requests = 128
         settings.scheduler.embedding_batch_size = 12
+        settings.scheduler.concurrent_priority = "decode"
 
         scheduler_config = settings.to_scheduler_config()
+        assert scheduler_config.decode_fairness is True
+        assert scheduler_config.adaptive_decode_share is False
         assert scheduler_config.max_num_seqs == 128
         assert scheduler_config.completion_batch_size == 128
         assert scheduler_config.embedding_batch_size == 12
@@ -3110,7 +3120,11 @@ class TestUISettings:
 
         layout = {"version": 1, "width": "wide", "blocks": []}
         result = UISettings(language="ko", dashboard_layout=layout).to_dict()
-        assert result == {"language": "ko", "dashboard_layout": layout}
+        assert result == {
+            "language": "ko",
+            "dashboard_layout": layout,
+            "custom_theme": None,
+        }
 
     def test_from_dict_legacy_without_layout(self):
         from omlx.settings import UISettings
@@ -3137,6 +3151,46 @@ class TestUISettings:
 
         restored = GlobalSettings.load(base_path=tmp_path)
         assert restored.ui.dashboard_layout == layout
+
+
+class TestCustomThemeRoute:
+    """/api/global-settings validates and persists ui_custom_theme."""
+
+    def _post(self, gs, monkeypatch, body):
+        import asyncio
+
+        from omlx.admin import routes as admin_routes
+
+        monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: gs)
+        request = admin_routes.GlobalSettingsRequest.model_validate(body)
+        return asyncio.run(
+            admin_routes.update_global_settings(request=request, is_admin=True)
+        )
+
+    def test_post_persists_and_null_restores(self, tmp_path, monkeypatch):
+        from omlx.admin import routes as admin_routes
+
+        gs = GlobalSettings(base_path=tmp_path)
+        theme = {"light": {"bg-primary": "#FDF6E3"}, "dark": {}}
+        self._post(gs, monkeypatch, {"ui_custom_theme": theme})
+        saved = {"light": {"bg-primary": "#fdf6e3"}, "dark": {}}
+        assert GlobalSettings.load(base_path=tmp_path).ui.custom_theme == saved
+        assert admin_routes.configured_custom_theme() == saved
+
+        self._post(gs, monkeypatch, {"ui_custom_theme": None})
+        assert gs.ui.custom_theme is None
+
+    @pytest.mark.parametrize(
+        "colors",
+        [{"bg-primary": "red"}, {"text-primary": "#00000000"}, {"Bad Key": "#000000"}],
+    )
+    def test_rejects_malformed_colors(self, colors):
+        from pydantic import ValidationError
+
+        from omlx.admin.routes import CustomThemeRequest
+
+        with pytest.raises(ValidationError):
+            CustomThemeRequest.model_validate({"light": colors})
 
 
 class TestDashboardLayoutRoute:

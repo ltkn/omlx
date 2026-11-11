@@ -61,11 +61,14 @@ final class LocalizationSmokeTests: XCTestCase {
         "security.section.api_key", "security.api_key.row_label",
         "integrations.section.claude_code", "integrations.tool.codex",
         "integrations.section.external_engines",
+        "integrations.section.markitdown", "integrations.markitdown.pdf_processing_missing_model",
         "performance.section.cache", "performance.cache.enabled",
         "askai.row.enabled", "askai.section.presets",
+        "settings.search.prompt", "settings.search.empty",
         "status.section.system", "status.section.active_now",
         // High-density screens
         "models.active.title", "models.library.title",
+        "models.updates.check", "models.updates.available",
         "downloads.hf.section.title", "downloads.active.title",
         "quant.header.title", "quant.about.title",
         // Profile + bench

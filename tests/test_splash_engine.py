@@ -1067,10 +1067,19 @@ class TestRequestTranslation:
         for flag in (
             "--max-context",
             "--max-memory",
-            "--max-cache-disk",
             "--disable-ane",
         ):
             assert flag not in command
+
+    def test_serve_command_turns_ssd_cache_off_without_omlx_ssd_cache(self, tmp_path):
+        # Cache disabled, hot cache only and a Splash SSD size of 0 all reach
+        # Splash as cache_disk_bytes == 0.
+        command = _engine(tmp_path)._serve_command(9000)
+
+        assert command[command.index("--max-cache-disk") + 1] == "0"
+        # Splash rejects --persistent-cache next to --max-cache-disk 0.
+        assert "--persistent-cache" not in command
+        assert "--cache-dir" not in command
 
     def test_request_body_passes_sampling_through(self, tmp_path):
         body = _engine(tmp_path)._request_body(
@@ -2199,7 +2208,13 @@ class TestSplashBenchmark:
         assert bench.overhead == 0
         assert bench.prompt(100) == "tokens:100"
 
-    async def test_run_benchmark_against_splash_endpoint(self, monkeypatch):
+    @pytest.mark.parametrize(
+        ("saved_window", "launch_window"),
+        [(None, None), (1024, 1024 + 128), (131072, None)],
+    )
+    async def test_run_benchmark_against_splash_endpoint(
+        self, monkeypatch, saved_window, launch_window
+    ):
         stats = StreamStats(
             prompt_tokens=1000,
             completion_tokens=100,
@@ -2224,6 +2239,11 @@ class TestSplashBenchmark:
         pool.get_entry.return_value = SimpleNamespace(
             model_type="qwen3_5", model_settings=None, model_path=Path("/tmp/model")
         )
+        settings = ModelSettings(
+            external_engine="splash", max_context_window=saved_window
+        )
+        pool._settings_manager.get_settings.return_value = settings
+        pool.external_engine_id.return_value = "splash"
         run = BenchmarkRun(
             bench_id="splash-run-1",
             request=BenchmarkRequest(
@@ -2234,6 +2254,10 @@ class TestSplashBenchmark:
         await run_benchmark(run, pool)
 
         client.aclose.assert_awaited_once()
+        # Only a saved window shorter than the run grows, and only for this launch.
+        runtime_settings = pool.get_engine.await_args.kwargs["runtime_settings"]
+        assert getattr(runtime_settings, "max_context_window", None) == launch_window
+        assert settings.max_context_window == saved_window
         results = {r["test_type"]: r for r in run.results}
         assert (results["single"]["requested_pp"], results["single"]["pp"]) == (
             1024,
@@ -2270,6 +2294,25 @@ class TestSplashRuntimeCache:
         assert engine._status == payload
         await engine.stop()
         assert engine._status_task is None
+
+    async def test_status_refresh_keeps_a_cancel_raised_as_timeout(self, tmp_path):
+        # Older anyio raises the request timeout in place of a cancel that
+        # lands with the deadline.
+        fetching = asyncio.Event()
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            fetching.set()
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                raise httpx.ReadTimeout("timed out", request=request) from None
+
+        engine = _engine_with_transport(tmp_path, handler)
+        task = asyncio.create_task(engine._refresh_status())
+        await fetching.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
     def test_cache_dashboard_lists_splash_next_to_mlx(self, tmp_path):
         settings = SimpleNamespace(

@@ -112,6 +112,12 @@ def test_reasoning_effort_has_presets_and_custom_input():
 
     assert 'x-for="value in selectedModel?.reasoning_effort_options || []"' in section
     assert ':value="value" x-text="value"' in section
+    # x-model runs before x-for adds the options, so each option binds its own selection.
+    assert ':selected="value === entry.value"' in section
+    assert (
+        ':selected="!selectedModel?.reasoning_effort_options?.includes(entry.value)"'
+        in section
+    )
     assert "!selectedModel?.reasoning_effort_custom && !entry.custom" in section
 
 
@@ -450,6 +456,7 @@ def test_a8_prefill_toggle_is_gated_to_supported_models():
     )
     assert 'x-if="showsA8Prefill(selectedModel)"' in section
     assert "modelSettings.a8_prefill_enabled" in section
+    assert "modal.model_settings.qwen_oq_a8_quality_badge" in section
     # The detail controls only appear once the feature is on.
     assert 'x-show="modelSettings.a8_prefill_enabled"' in section
     assert "modelSettings.a8_prefill_min_tokens" in section
@@ -915,7 +922,7 @@ const ids = () => plain(app.servingStatTiles.map(tile => tile.id));
 
 app.dashLayout = context.DashboardLayout.defaultLayout();
 assert.deepEqual(ids(), ['requests', 'prefill_tokens', 'cached_tokens', 'cache_efficiency']);
-assert.equal(app.servingStatGridClass, 'sm:grid-cols-2 lg:grid-cols-4');
+assert.equal(app.servingStatGridClass, 'grid-cols-2 lg:grid-cols-4');
 
 app.dashEditing = true;
 app.dashDraft = { width: 'default', ...app._dashServingTileDraft(app.dashLayout.serving_stats_tiles) };
@@ -927,6 +934,7 @@ assert.equal(app.dashTileLocked('generated_tokens'), true);
 app.toggleDashTile('generated_tokens');
 assert.equal(app.dashTileChecked('generated_tokens'), false);
 app.toggleDashTile('cached_tokens');
+assert.equal(app.servingStatGridClass, 'grid-cols-2 lg:grid-cols-3');
 app.toggleDashTile('generated_tokens');
 assert.deepEqual(ids(), ['requests', 'prefill_tokens', 'cache_efficiency', 'generated_tokens']);
 
@@ -950,7 +958,7 @@ assert.deepEqual(ids(), ['requests']);
 assert.equal(app.dashTileLocked('requests'), true);
 app.toggleDashTile('requests');
 assert.deepEqual(ids(), ['requests']);
-assert.equal(app.servingStatGridClass, '');
+assert.equal(app.servingStatGridClass, 'grid-cols-1');
 
 // Values follow the stats scope.
 app.toggleDashTile('generated_tokens');

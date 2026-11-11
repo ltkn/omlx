@@ -10,6 +10,7 @@ import asyncio
 import copy
 import functools
 import logging
+import threading
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -17,6 +18,7 @@ from ..adapter.output_parser import repair_tool_parser
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..model_settings import (
+    a8_prefill_on,
     ane_prefill_backend,
     ane_prefill_fraction,
     validate_ane_prefill,
@@ -104,6 +106,7 @@ class BatchedEngine(BaseEngine):
         self._dflash_drafter: Any | None = None
         self._grammar_compiler = None
         self._grammar_compiler_init_attempted = False
+        self._grammar_compiler_lock = threading.Lock()
 
     async def _preflight_or_raise_with_eviction(
         self,
@@ -209,49 +212,53 @@ class BatchedEngine(BaseEngine):
         """
         if self._grammar_compiler is not None:
             return self._grammar_compiler
-        if self._grammar_compiler_init_attempted:
-            return None
-        self._grammar_compiler_init_attempted = True
-        try:
-            from ..api.grammar import create_grammar_compiler
+        # Prompt preparation calls this from worker threads. Build it once.
+        with self._grammar_compiler_lock:
+            if self._grammar_compiler is not None:
+                return self._grammar_compiler
+            if self._grammar_compiler_init_attempted:
+                return None
+            self._grammar_compiler_init_attempted = True
+            try:
+                from ..api.grammar import create_grammar_compiler
 
-            self._grammar_compiler = create_grammar_compiler(
-                self._tokenizer,
-                self._model,
-                cache_limit_bytes=(
-                    64 * 1024**2 if self.model_type == "k2_horizon" else -1
-                ),
-            )
-            logger.info("GrammarCompiler initialized for %s", self._model_name)
-        except Exception:
-            from ..utils.install import get_install_method
+                self._grammar_compiler = create_grammar_compiler(
+                    self._tokenizer,
+                    self._model,
+                    cache_limit_bytes=(
+                        64 * 1024**2 if self.model_type == "k2_horizon" else -1
+                    ),
+                )
+                logger.info("GrammarCompiler initialized for %s", self._model_name)
+            except Exception:
+                from ..utils.install import get_install_method
 
-            method = get_install_method()
-            if self.model_type == "k2_horizon":
-                logger.info(
-                    "K2 tool grammar is unavailable; generating unconstrained "
-                    "tool calls with normal API parsing. Install omlx[grammar] "
-                    "to enable tool-name constraints."
-                )
-            elif method == "dmg":
-                logger.warning(
-                    "GrammarCompiler initialization failed for %s on the "
-                    "DMG build. The bundle ships xgrammar against a torch "
-                    "stub; this usually means the bundled xgrammar / tvm-"
-                    "ffi version drifted past what the stub covers.",
-                    self._model_name,
-                )
-            elif method == "homebrew":
-                logger.info(
-                    "Structured output requires xgrammar. "
-                    "Reinstall with: brew reinstall omlx --with-grammar"
-                )
-            else:
-                logger.info(
-                    "Structured output requires xgrammar. "
-                    "Install with: pip install 'omlx[grammar]'"
-                )
-        return self._grammar_compiler
+                method = get_install_method()
+                if self.model_type == "k2_horizon":
+                    logger.info(
+                        "K2 tool grammar is unavailable; generating unconstrained "
+                        "tool calls with normal API parsing. Install omlx[grammar] "
+                        "to enable tool-name constraints."
+                    )
+                elif method == "dmg":
+                    logger.warning(
+                        "GrammarCompiler initialization failed for %s on the "
+                        "DMG build. The bundle ships xgrammar against a torch "
+                        "stub; this usually means the bundled xgrammar / tvm-"
+                        "ffi version drifted past what the stub covers.",
+                        self._model_name,
+                    )
+                elif method == "homebrew":
+                    logger.info(
+                        "Structured output requires xgrammar. "
+                        "Reinstall with: brew reinstall omlx --with-grammar"
+                    )
+                else:
+                    logger.info(
+                        "Structured output requires xgrammar. "
+                        "Install with: pip install 'omlx[grammar]'"
+                    )
+            return self._grammar_compiler
 
     @property
     def prefix_cache_enabled(self) -> bool:
@@ -531,7 +538,7 @@ class BatchedEngine(BaseEngine):
         # oQ mixed-bit QxA8 prefill kernels. Gated on the per-model setting
         # because it quantizes activations to INT8, which changes numerics;
         # the patch itself falls through for anything it cannot route.
-        if getattr(self._model_settings, "a8_prefill_enabled", False):
+        if a8_prefill_on(self._model_settings):
             try:
                 from ..patches.qwen35_oq_a8 import apply_qwen35_oq_a8_patch
 
@@ -1660,6 +1667,25 @@ class BatchedEngine(BaseEngine):
         if self._engine:
             return self._engine.get_cache_stats()
         return None
+
+    async def abort_request(
+        self,
+        request_id: str,
+        *,
+        reason: str | None = None,
+        error_code: str | None = None,
+    ) -> bool:
+        """Abort one live request; False when it is unknown or already finished."""
+        core = self._engine.engine if self._engine else None
+        if (
+            core is None
+            or request_id not in core._output_collectors
+            or request_id in core._finished_at
+        ):
+            return False
+        return await core.abort_request(
+            request_id, reason=reason, error_code=error_code
+        )
 
     async def abort_all_requests(
         self,
