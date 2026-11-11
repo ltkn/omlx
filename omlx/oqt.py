@@ -32,10 +32,15 @@ uses (weighted by the Hessian diagonal).
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
-from dataclasses import dataclass
+import time
+from pathlib import Path
+from typing import Any, Callable
 
 import mlx.core as mx
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -48,53 +53,110 @@ _CLIP_FACTORS = (0.5, 0.625, 0.75, 0.875, 1.0, 1.125, 1.25)
 # ---------------------------------------------------------------------------
 
 
-@dataclass
 class HessianAccumulator:
     """Running ``Σ x xᵀ`` and token count for one input space.
 
-    ``batch`` > 0 keeps one accumulator per expert (``[E, in, in]``).
+    Dense (``batch == 0``): one ``[in, in]`` sum.
+
+    Experts (``batch == E``): one ``[in, in]`` sum **per expert, stored as
+    separate arrays** (never one stacked ``[E, in, in]`` tensor, which MLX
+    would copy on every per-expert update), plus a running total for the
+    layer-wide average used by shrinkage. Routed tokens are sorted by expert
+    and each expert's slice is multiplied once, so the work is ``k·T·in²``
+    rather than ``E·T·in²``.
     """
 
-    in_dim: int
-    batch: int = 0
+    def __init__(self, in_dim: int, batch: int = 0):
+        self.in_dim = int(in_dim)
+        self.batch = int(batch)
+        if self.batch:
+            self.expert_sums: list[mx.array | None] = [None] * self.batch
+            self.total = mx.zeros((self.in_dim, self.in_dim), dtype=mx.float32)
+            self.counts = np.zeros((self.batch,), dtype=np.float64)
+        else:
+            self.total = mx.zeros((self.in_dim, self.in_dim), dtype=mx.float32)
+            self.counts = np.zeros((), dtype=np.float64)
 
-    def __post_init__(self):
-        shape = (self.batch, self.in_dim, self.in_dim) if self.batch else (self.in_dim, self.in_dim)
-        self.sum_xxT = mx.zeros(shape, dtype=mx.float32)
-        self.count = mx.zeros((self.batch,) if self.batch else (), dtype=mx.float32)
-
+    # -- dense ------------------------------------------------------------
     def add(self, x: mx.array) -> None:
-        """Dense input: ``x[..., in_dim]``."""
+        """Dense input ``x[..., in_dim]``."""
         x = x.reshape(-1, self.in_dim).astype(mx.float32)
-        self.sum_xxT = self.sum_xxT + x.T @ x
-        self.count = self.count + x.shape[0]
+        self.total = self.total + x.T @ x
+        self.counts = self.counts + x.shape[0]
+        mx.eval(self.total)
 
+    # -- experts ----------------------------------------------------------
     def add_routed(self, x: mx.array, expert_ids: mx.array) -> None:
-        """Routed input: ``x[T, in_dim]`` with ``expert_ids[T, k]``.
+        """Token-level input ``x[T, in]`` routed to ``expert_ids[T, k]``."""
+        x = x.reshape(-1, self.in_dim)
+        ids = np.asarray(expert_ids).reshape(x.shape[0], -1).astype(np.int64)
+        k = ids.shape[1]
+        self._add_pairs(x, np.repeat(np.arange(x.shape[0]), k), ids.reshape(-1))
 
-        Each token contributes to every expert it was routed to. Done as one
-        scatter-free matmul per expert chunk via a one-hot routing matrix.
-        """
-        x = x.reshape(-1, self.in_dim).astype(mx.float32)
-        ids = expert_ids.reshape(x.shape[0], -1)
-        onehot = mx.zeros((x.shape[0], self.batch), dtype=mx.float32)
-        for k in range(ids.shape[1]):
-            onehot = onehot + (ids[:, k : k + 1] == mx.arange(self.batch)[None, :]).astype(mx.float32)
-        # Σ_t onehot[t,e] x_t x_tᵀ  ==  (x * onehot[:, e])ᵀ x, batched over e.
-        weighted = onehot.T[:, :, None] * x[None, :, :]          # [E, T, in]
-        self.sum_xxT = self.sum_xxT + weighted.swapaxes(-1, -2) @ x[None]
-        self.count = self.count + onehot.sum(axis=0)
+    def add_pairs(self, x_pairs: mx.array, expert_ids: mx.array) -> None:
+        """Pair-level input (one row per (token, expert) pair), e.g. down_proj."""
+        x_pairs = x_pairs.reshape(-1, self.in_dim)
+        ids = np.asarray(expert_ids).reshape(-1).astype(np.int64)
+        self._add_pairs(x_pairs, np.arange(x_pairs.shape[0]), ids)
+
+    def _add_pairs(self, x, rows: np.ndarray, ids: np.ndarray) -> None:
+        valid = (ids >= 0) & (ids < self.batch)
+        rows, ids = rows[valid], ids[valid]
+        if ids.size == 0:
+            return
+        order = np.argsort(ids, kind="stable")
+        ids, rows = ids[order], rows[order]
+        counts = np.bincount(ids, minlength=self.batch)
+        starts = np.concatenate([[0], np.cumsum(counts)])
+        xs = x[mx.array(rows)].astype(mx.float32)               # [P, in], sorted by expert
+        self.total = self.total + xs.T @ xs
+        pending = []
+        for e in np.nonzero(counts)[0]:
+            seg = xs[int(starts[e]) : int(starts[e + 1])]
+            upd = seg.T @ seg
+            cur = self.expert_sums[e]
+            self.expert_sums[e] = upd if cur is None else cur + upd
+            pending.append(self.expert_sums[e])
+            if len(pending) >= 32:
+                mx.eval(*pending)
+                pending.clear()
+        mx.eval(self.total, *pending)
+        self.counts += counts
+
+    # -- views ------------------------------------------------------------
+    @property
+    def count(self) -> mx.array:
+        return mx.array(self.counts.astype(np.float32))
+
+    @property
+    def sum_xxT(self) -> mx.array:
+        """Stacked sums (small models / tests only; experts stack ``[E, in, in]``)."""
+        if not self.batch:
+            return self.total
+        return self.expert_chunk(0, self.batch)
+
+    def expert_chunk(self, e0: int, e1: int) -> mx.array:
+        z = mx.zeros((self.in_dim, self.in_dim), dtype=mx.float32)
+        return mx.stack([z if s is None else s for s in self.expert_sums[e0:e1]])
+
+    def layer_mean(self) -> mx.array:
+        """Per-token ``E[x xᵀ]`` over everything this accumulator saw."""
+        n = float(self.counts.sum()) if self.batch else float(self.counts)
+        return self.total / max(n, 1.0)
 
     def mean(self) -> mx.array:
-        """Per-token average ``E[x xᵀ]`` (zero where no tokens were seen)."""
+        """Dense: ``E[x xᵀ]``. Experts: per-expert means, stacked."""
+        if not self.batch:
+            return self.layer_mean()
         c = mx.maximum(self.count, 1.0)
-        if self.batch:
-            return self.sum_xxT / c[:, None, None]
-        return self.sum_xxT / c
+        return self.sum_xxT / c[:, None, None]
 
 
 def shrink_expert_hessians(
-    sum_xxT: mx.array, counts: mx.array, prior_tokens: float = 256.0
+    sum_xxT: mx.array,
+    counts: mx.array,
+    prior_tokens: float = 256.0,
+    h_bar: mx.array | None = None,
 ) -> mx.array:
     """Blend each expert's Hessian toward the layer-wide average.
 
@@ -102,10 +164,12 @@ def shrink_expert_hessians(
     expert's tokens, ``H̄`` the per-token average over all routed tokens and
     ``λ = prior_tokens``. A well-covered expert (``n_e ≫ λ``) keeps its own
     statistics; an unseen expert gets the layer average instead of a zero
-    matrix.
+    matrix. ``h_bar`` defaults to the average over the experts passed in; pass
+    the full layer's average when shrinking a chunk of experts.
     """
-    total = mx.maximum(counts.sum(), 1.0)
-    h_bar = sum_xxT.sum(axis=0) / total
+    if h_bar is None:
+        total = mx.maximum(counts.sum(), 1.0)
+        h_bar = sum_xxT.sum(axis=0) / total
     return (sum_xxT + prior_tokens * h_bar[None]) / (counts + prior_tokens)[:, None, None]
 
 
@@ -347,8 +411,7 @@ def gptq_quantize(
 
 def gptq_quantize_experts(
     w: mx.array,
-    sum_xxT: mx.array,
-    counts: mx.array,
+    acc: "HessianAccumulator",
     bits: int,
     group_size: int = 64,
     *,
@@ -358,15 +421,19 @@ def gptq_quantize_experts(
 ):
     """GPTQ for stacked experts ``w[E, out, in]`` with per-expert statistics.
 
-    Hessians are shrunk toward the layer average (:func:`shrink_expert_hessians`)
-    and processed ``expert_chunk`` experts at a time to bound memory
-    (``chunk · in² · 4`` bytes for the Cholesky factors).
+    Hessians come from ``acc`` (a batched :class:`HessianAccumulator`), are
+    shrunk toward the layer average (:func:`shrink_expert_hessians`) and are
+    processed ``expert_chunk`` experts at a time to bound memory
+    (``chunk · in² · 4`` bytes per factor).
     """
-    h = shrink_expert_hessians(sum_xxT, counts, prior_tokens)
+    h_bar = acc.layer_mean()
+    counts = acc.count
     parts = []
     for e0 in range(0, w.shape[0], expert_chunk):
         e1 = min(e0 + expert_chunk, w.shape[0])
-        parts.append(gptq_quantize(w[e0:e1], h[e0:e1], bits, group_size, **kwargs))
+        h = shrink_expert_hessians(acc.expert_chunk(e0, e1), counts[e0:e1], prior_tokens, h_bar)
+        parts.append(gptq_quantize(w[e0:e1], h, bits, group_size, **kwargs))
+        del h
         mx.clear_cache()
     packed = mx.concatenate([p[0] for p in parts], axis=0)
     scales = mx.concatenate([p[1] for p in parts], axis=0)
@@ -382,3 +449,513 @@ def output_error(w: mx.array, wq: mx.array, h: mx.array) -> float:
     num = mx.sum((d @ h) * d)
     den = mx.sum((w @ h) * w)
     return float((num / mx.maximum(den, 1e-12)).item())
+
+
+# ===========================================================================
+# Milestone 2 — the streamed sweep
+# ===========================================================================
+#
+# One extra pass over the checkpoint, after oQ's imatrix/sensitivity pass and
+# quant plan, with one decoder block resident at a time:
+#
+#   for each block:
+#     1. forward the calibration hidden states through the float block while
+#        a collector records the full input Hessian of every Linear and, per
+#        expert, of every SwitchLinear
+#     2. quantize each tensor with GPTQ at the bits/group size the oQ plan
+#        assigned it (``_get_predicate_bits``, the same call the writer makes)
+#     3. swap the dequantized weights into the block and forward again: the
+#        *quantized* block's output becomes the next block's input, so every
+#        block compensates the error accumulated upstream
+#     4. save the block's results to the cache (resumable)
+#
+# The writer then takes a tensor from the cache when name, bits, group size
+# and shape all match, and falls back to oQe otherwise (embeddings, lm_head,
+# MTP, vision, multi-linear MLA weights, pre-quantized source tensors).
+
+OQT_VERSION = "oqt-sweep-v1"
+
+
+def _oq():
+    # Attribute access at call time so tests can monkeypatch oq helpers.
+    from . import oq
+
+    return oq
+
+
+class OQTHessianCollector:
+    """Hessian-collecting twin of oQ's imatrix collector.
+
+    Reuses ``OQImatrixCollector.install/restore`` (same capture predicate,
+    same name prefixes, same skip set) but records ``Σ x xᵀ`` instead of the
+    diagonal. Projections that receive the *same* input array in the same
+    forward (q/k/v, gate/up) share one accumulator.
+    """
+
+    def __init__(self, skip: frozenset = frozenset()):
+        base = _oq().OQImatrixCollector(skip=skip)
+        self._base = base
+        # Route the base collector's capture callbacks here.
+        base.collect_dense = self.collect_dense
+        base.collect_switch = self.collect_switch
+        base.collect_multi = self.collect_multi
+        base.collect_glm5_next_embed_q = lambda *a, **k: None
+        self.hessians: dict[str, HessianAccumulator] = {}
+        self.alias: dict[str, str] = {}
+        self.unsupported: set[str] = set()
+        self._seen_inputs: dict[int, tuple[Any, str]] = {}
+
+    def install(self, block, name_prefix: str) -> dict[str, Any]:
+        n = self._base.install(block, name_prefix=name_prefix)
+        modules = dict(self._base._original_modules)
+        logger.debug("oQ-T: installed %d capture modules", n)
+        return modules
+
+    def restore(self, block) -> None:
+        self._base.restore(block)
+
+    def end_forward(self) -> None:
+        self._seen_inputs.clear()
+
+    def _shared(self, name: str, x, batch: int) -> bool:
+        """True when ``x`` was already accumulated for a compatible module this forward.
+
+        Compatible means same input width *and* same kind: dense with dense,
+        experts with the same expert count (a shared expert and the routed
+        experts can receive the very same hidden-state array).
+        """
+        prev = self._seen_inputs.get(id(x))
+        if prev is not None and prev[0] is x:
+            owner = prev[1]
+            acc = self.hessians.get(owner)
+            if (owner != name and acc is not None and acc.batch == batch
+                    and acc.in_dim == int(x.shape[-1])):
+                self.alias.setdefault(name, owner)
+                return True
+        self._seen_inputs[id(x)] = (x, name)
+        return False
+
+    def collect_dense(self, name: str, module, x) -> None:
+        in_dim = self._base._module_in_dim(module)
+        if not getattr(x, "shape", ()) or int(x.shape[-1]) != in_dim:
+            return
+        if name in self.alias or self._shared(name, x, 0):
+            return
+        acc = self.hessians.get(name)
+        if acc is None:
+            acc = self.hessians[name] = HessianAccumulator(in_dim)
+        acc.add(x)
+
+    def collect_switch(self, name: str, module, x, indices) -> None:
+        weight_shape = getattr(module.weight, "shape", ())
+        n_experts = int(getattr(module, "num_experts", weight_shape[0]))
+        in_dim = int(getattr(module, "input_dims", weight_shape[-1]))
+        if not getattr(x, "shape", ()) or int(x.shape[-1]) != in_dim:
+            return
+        if name in self.alias or self._shared(name, x, n_experts):
+            return
+        acc = self.hessians.get(name)
+        if acc is None:
+            acc = self.hessians[name] = HessianAccumulator(in_dim, batch=n_experts)
+        xf = x.reshape(-1, in_dim)
+        idx = np.asarray(indices)
+        rows = idx.reshape(-1, idx.shape[-1]) if idx.ndim > 1 else idx.reshape(-1, 1)
+        if xf.shape[0] == rows.shape[0]:
+            acc.add_routed(xf, mx.array(rows))         # token-level input (gate/up)
+        elif xf.shape[0] == rows.size:
+            acc.add_pairs(xf, mx.array(rows.reshape(-1)))  # pair-level input (down)
+        else:
+            self.unsupported.add(name)
+
+    def collect_multi(self, name: str, module, x, *, transpose: bool = True) -> None:
+        # MLA MultiLinear weights stay on the oQe path for now.
+        self.unsupported.add(name)
+
+    def accumulator(self, name: str) -> HessianAccumulator | None:
+        return self.hessians.get(self.alias.get(name, name))
+
+
+def _resolve_module(root, dotted: str):
+    m = root
+    for part in dotted.split("."):
+        m = m[int(part)] if part.isdigit() and isinstance(m, (list, tuple)) else getattr(m, part)
+    return m
+
+
+def _file_digest(path: str | None) -> str:
+    """Content hash of a calibration path (file or directory of .txt files)."""
+    if not path:
+        return ""
+    p = Path(path).expanduser()
+    h = hashlib.sha256()
+    if p.is_file():
+        h.update(p.read_bytes())
+    elif p.is_dir():
+        for f in sorted(p.rglob("*.txt")):
+            h.update(f.name.encode())
+            h.update(f.read_bytes())
+    else:
+        h.update(str(path).encode())     # built-in dataset name
+    return h.hexdigest()
+
+
+def _packed_shape(shape: tuple[int, ...], bits: int) -> tuple[int, ...]:
+    return (*shape[:-1], shape[-1] * bits // 32)
+
+
+class OQTCache:
+    """Per-layer results on disk: ``layer-NNN.safetensors`` + ``layer-NNN.json``.
+
+    Each layer's JSON carries a chain digest (this layer's settings plus the
+    previous layer's digest), because a block's inputs depend on every
+    quantized block before it. A layer is reused only when its digest matches.
+    """
+
+    def __init__(self, cache_dir: str | Path):
+        self.dir = Path(cache_dir).expanduser()
+        self.dir.mkdir(parents=True, exist_ok=True)
+
+    def _paths(self, layer_idx: int):
+        stem = self.dir / f"layer-{layer_idx:03d}"
+        return stem.with_suffix(".safetensors"), stem.with_suffix(".json")
+
+    def load(self, layer_idx: int, digest: str):
+        tensors_path, meta_path = self._paths(layer_idx)
+        if not (tensors_path.exists() and meta_path.exists()):
+            return None
+        meta = json.loads(meta_path.read_text())
+        if meta.get("digest") != digest:
+            return None
+        return meta
+
+    def save(self, layer_idx: int, digest: str, tensors: dict, meta: dict) -> None:
+        tensors_path, meta_path = self._paths(layer_idx)
+        tmp = tensors_path.with_name(tensors_path.stem + ".tmp.safetensors")
+        if tensors:
+            mx.save_safetensors(str(tmp), tensors)
+            tmp.replace(tensors_path)
+        else:
+            mx.save_safetensors(str(tensors_path), {"_empty": mx.zeros((1,))})
+        meta = {**meta, "digest": digest}
+        meta_path.write_text(json.dumps(meta, indent=1))
+
+
+class OQTResults:
+    """Writer-side lookup over a finished sweep's cache."""
+
+    def __init__(self, cache: OQTCache, layers: dict[int, dict]):
+        self.cache = cache
+        self.layers = layers
+        self.index: dict[str, tuple[int, dict]] = {}
+        for layer_idx, meta in layers.items():
+            for base, info in meta.get("tensors", {}).items():
+                self.index[base] = (layer_idx, info)
+        self._loaded: tuple[int, dict] | None = None
+        self.used: list[str] = []
+        self.declined: list[dict] = []
+
+    def _tensors(self, layer_idx: int) -> dict:
+        if self._loaded is None or self._loaded[0] != layer_idx:
+            self._loaded = (layer_idx, mx.load(str(self.cache._paths(layer_idx)[0])))
+        return self._loaded[1]
+
+    def lookup(self, tensor_name: str, bits: int, group_size: int, shape):
+        if not tensor_name.endswith(".weight"):
+            return None
+        base = tensor_name[: -len(".weight")]
+        hit = self.index.get(base)
+        if hit is None:
+            return None
+        layer_idx, info = hit
+        if info["bits"] != bits or info["group_size"] != group_size:
+            self.declined.append({"tensor": base, "reason": "plan changed",
+                                  "cached": [info["bits"], info["group_size"]],
+                                  "writer": [bits, group_size]})
+            return None
+        t = self._tensors(layer_idx)
+        qw, scales, biases = t[f"{base}.weight"], t[f"{base}.scales"], t[f"{base}.biases"]
+        if tuple(qw.shape) != _packed_shape(tuple(shape), bits):
+            self.declined.append({"tensor": base, "reason": "shape mismatch",
+                                  "cached": list(qw.shape), "writer": list(shape)})
+            return None
+        self.used.append(base)
+        return qw, scales, biases
+
+    def report(self) -> dict:
+        per_tensor = {}
+        for meta in self.layers.values():
+            per_tensor.update(meta.get("tensors", {}))
+        errs = [(v["err_oqt"], v["err_oqe"]) for v in per_tensor.values()
+                if v.get("err_oqt") is not None and v.get("err_oqe")]
+        summary = {}
+        if errs:
+            ratio = np.array([a / b for a, b in errs if b > 0])
+            summary = {
+                "tensors_compared": len(errs),
+                "median_err_ratio_oqt_vs_oqe": float(np.median(ratio)),
+                "mean_err_ratio_oqt_vs_oqe": float(np.mean(ratio)),
+                "share_tensors_improved": float(np.mean(ratio < 1.0)),
+            }
+        return {
+            "version": OQT_VERSION,
+            "summary": summary,
+            "used": sorted(set(self.used)),
+            "declined_by_writer": self.declined,
+            "skipped_in_sweep": {k: v for m in self.layers.values()
+                                 for k, v in m.get("skipped", {}).items()},
+            "layers": {str(k): {kk: vv for kk, vv in v.items() if kk != "tensors"}
+                       for k, v in sorted(self.layers.items())},
+            "tensors": per_tensor,
+        }
+
+
+def _relative_output_error(w: mx.array, wq: mx.array, acc: HessianAccumulator,
+                           prior_tokens: float, expert_chunk: int = 32) -> float:
+    """Mean relative output error, per expert for switch weights."""
+    w = w.astype(mx.float32)
+    wq = wq.astype(mx.float32)
+    if not acc.batch:
+        h = acc.layer_mean()
+        return output_error(w, wq, h)
+    h_bar = acc.layer_mean()
+    counts = acc.count
+    num = den = 0.0
+    for e0 in range(0, w.shape[0], expert_chunk):
+        e1 = min(e0 + expert_chunk, w.shape[0])
+        h = shrink_expert_hessians(acc.expert_chunk(e0, e1), counts[e0:e1], prior_tokens, h_bar)
+        d = w[e0:e1] - wq[e0:e1]
+        num += float(mx.sum((d @ h) * d).item())
+        den += float(mx.sum((w[e0:e1] @ h) * w[e0:e1]).item())
+    return num / max(den, 1e-12)
+
+
+def run_streaming_sweep(
+    model_path: str,
+    config: dict,
+    oq_level: float,
+    group_size: int,
+    *,
+    cache_dir: str,
+    calib_dataset: str,
+    num_samples: int = 128,
+    seq_length: int = 2048,
+    target_dtype=mx.bfloat16,
+    trust_remote_code: bool = False,
+    progress_callback: Callable | None = None,
+    calib_data: mx.array | None = None,
+    calib_seed: int | None = None,
+    prior_tokens: float = 256.0,
+    damp: float = 0.01,
+    group_params: str = "best",
+    expert_chunk: int = 32,
+    compare_oqe: bool = True,
+) -> OQTResults:
+    """Run the oQ-T sweep and return the writer-side lookup.
+
+    ``config`` must already carry the quant plan (``_oq_boost_map``), exactly
+    as the writer will see it.
+    """
+    oq = _oq()
+    model_type = oq._stream_source_model_type(config)
+    if model_type == "deepseek_v41":
+        raise NotImplementedError(
+            "oQ-T streaming sweep does not support DeepSeek V4.1 yet "
+            "(it has its own calibration path); use oQe for this model")
+    if not oq._stream_calibration_supported(model_type):
+        raise ValueError(f"oQ-T needs a streamable layout; {model_type!r} is not one")
+
+    from mlx_lm.tokenizer_utils import load as load_tokenizer
+
+    source = Path(model_path)
+    cache = OQTCache(cache_dir)
+    seed = oq._OQE_STREAM_CALIB_SEED if calib_seed is None else int(calib_seed)
+    if calib_data is None:
+        tokenizer = load_tokenizer(source)
+        mx.random.seed(seed)
+        calib_data = oq._load_calibration_data(
+            tokenizer, dataset=calib_dataset, num_samples=num_samples, seq_length=seq_length)
+    if calib_data is None:
+        raise RuntimeError(f"oQ-T: no calibration data from {calib_dataset!r}")
+    calib_data = calib_data[:num_samples]
+    n_samples = int(calib_data.shape[0])
+
+    batch_plan = oq._oqe_calibration_batch_plan(
+        config, requested_samples=n_samples, seq_length=int(calib_data.shape[1]))
+    micro = max(1, int(batch_plan["micro_batch_size"]))
+    ranges = [(lo, min(lo + micro, n_samples)) for lo in range(0, n_samples, micro)]
+
+    is_qwen4_exp = model_type == "qwen4_exp"
+    is_glm5_next = model_type == "glm5_next"
+    if is_qwen4_exp:
+        oq._qwen4_exp_apply_compat_patch()
+    embed_weight = oq._streamed_embed_weight(source, config)
+    embedded = oq._streamed_embed(embed_weight, calib_data, config)
+    mx.eval(embedded)
+    del embed_weight
+    mx.clear_cache()
+
+    slot_states = None
+    if is_qwen4_exp:
+        embedded, q4_layer_masks, q4_position_ids = oq._streamed_qwen4_exp_state(
+            config, calib_data, embedded)
+        mx.eval(embedded)
+        slot_states = [oq._streamed_qwen4_exp_slot_state(calib_data, q4_position_ids, lo, hi)
+                       for lo, hi in ranges]
+        mask = position_ids = None
+    elif is_glm5_next:
+        embedded, mask = oq._streamed_glm5_next_state(config, embedded)
+        mx.eval(embedded)
+        position_ids = {"kind": oq._GLM5_NEXT_LAYER_STATE_KIND}
+    elif model_type == "flint":
+        mask, position_ids = None, {"kind": oq._FLINT_LAYER_STATE_KIND}
+    else:
+        _, layer_masks, position_ids = oq._prepare_layer_inputs(
+            oq._StreamingNoModel(), [None], calib_data[:1], embedded[:1],
+            noncausal=oq._noncausal_attention(config))
+        mask = layer_masks[0]
+
+    working = [embedded[lo:hi] for lo, hi in ranges]
+    del embedded
+
+    settings = {
+        "version": OQT_VERSION, "source": str(source.resolve()),
+        "calib": _file_digest(calib_dataset), "calib_name": str(calib_dataset),
+        "samples": n_samples, "seq_length": int(calib_data.shape[1]), "seed": seed,
+        "oq_level": float(oq_level), "group_size": int(group_size),
+        "dtype": str(target_dtype), "prior_tokens": prior_tokens, "damp": damp,
+        "group_params": group_params,
+    }
+    prev_digest = hashlib.sha256(json.dumps(settings, sort_keys=True).encode()).hexdigest()
+
+    text_config = config.get("text_config") or {}
+    total_layers = int(text_config.get("num_hidden_layers") or config.get("num_hidden_layers") or 0)
+    skip = config.get("_oq_imatrix_capture_skip", frozenset())
+    layers_meta: dict[int, dict] = {}
+    t_start = time.monotonic()
+
+    def forward_all(block, layer_idx, collector=None):
+        layer_mask = q4_layer_masks[layer_idx] if is_qwen4_exp else (
+            None if is_glm5_next and bool(getattr(block, "is_linear", False)) else mask)
+        for slot in range(len(working)):
+            state = slot_states[slot] if slot_states is not None else position_ids
+            out, _ = oq._forward_layer_result(block, working[slot], layer_mask, state,
+                                              layer_idx=layer_idx)
+            if out is None:
+                raise RuntimeError(f"oQ-T: layer {layer_idx} forward returned no output")
+            mx.eval(out)
+            if collector is not None:
+                collector.end_forward()
+            else:
+                working[slot] = out
+
+    for layer_idx, block, _is_moe in oq._iter_streamed_layer_blocks(
+        source, config, trust_remote_code=trust_remote_code
+    ):
+        prefix = f"{oq._STREAM_TEXT_LAYER_PREFIX}{layer_idx}."
+        t_layer = time.monotonic()
+
+        # Planned bits for every capture module of this block.
+        probe = OQTHessianCollector(skip=skip)
+        modules = probe.install(block, prefix)
+        probe.restore(block)
+        plan = {}
+        for rel, module in modules.items():
+            full = prefix + rel
+            bits, gs, mode = oq._get_predicate_bits(full + ".weight", config, oq_level, group_size)
+            plan[rel] = (bits, gs, mode)
+        digest = hashlib.sha256(json.dumps(
+            [prev_digest, layer_idx, sorted((k, list(v)) for k, v in plan.items())],
+            sort_keys=True, default=str).encode()).hexdigest()
+
+        meta = cache.load(layer_idx, digest)
+        if meta is not None:
+            tensors = mx.load(str(cache._paths(layer_idx)[0]))
+            for base, info in meta.get("tensors", {}).items():
+                rel = base[len(prefix):]
+                module = _resolve_module(block, rel)
+                module.weight = mx.dequantize(
+                    tensors[f"{base}.weight"], tensors[f"{base}.scales"], tensors[f"{base}.biases"],
+                    group_size=info["group_size"], bits=info["bits"]).astype(module.weight.dtype)
+            meta["reused"] = True
+            logger.info("oQ-T: layer %d reused from cache", layer_idx)
+        else:
+            collector = OQTHessianCollector(skip=skip)
+            collector.install(block, prefix)
+            try:
+                forward_all(block, layer_idx, collector)
+            finally:
+                collector.restore(block)
+
+            tensors, info_by_base, skipped = {}, {}, {}
+            for rel, module in modules.items():
+                full = prefix + rel
+                bits, gs, mode = plan[rel]
+                acc = collector.accumulator(full)
+                w = getattr(module, "weight", None)
+                reason = None
+                if bits is None or mode != "affine":
+                    reason = f"plan: bits={bits} mode={mode}"
+                elif acc is None:
+                    reason = "no activations captured"
+                elif full in collector.unsupported:
+                    reason = "unsupported module kind"
+                elif w is None or not mx.issubdtype(w.dtype, mx.floating):
+                    reason = "pre-quantized source tensor"
+                elif w.shape[-1] % gs:
+                    reason = "in_dim not a multiple of group size"
+                if reason:
+                    skipped[full] = reason
+                    continue
+                wf = w.astype(target_dtype)
+                kw = dict(damp=damp, store_dtype=target_dtype, group_params=group_params)
+                if acc.batch:
+                    qw, sc, bi = gptq_quantize_experts(wf, acc, bits, gs, prior_tokens=prior_tokens,
+                                                       expert_chunk=expert_chunk, **kw)
+                else:
+                    qw, sc, bi = gptq_quantize(wf, acc.layer_mean(), bits, gs, **kw)
+                deq = mx.dequantize(qw, sc, bi, group_size=gs, bits=bits)
+                info = {"bits": int(bits), "group_size": int(gs), "shape": list(w.shape),
+                        "tokens": float(acc.counts.sum()) if acc.batch else float(acc.counts)}
+                if acc.batch:
+                    c = acc.counts
+                    info["expert_tokens_p05"] = float(np.percentile(c, 5))
+                    info["experts_unseen"] = int((c == 0).sum())
+                if compare_oqe:
+                    info["err_oqt"] = _relative_output_error(wf, deq, acc, prior_tokens, expert_chunk)
+                    imp = (mx.diagonal(acc.layer_mean()) if not acc.batch else
+                           mx.stack([mx.diagonal(s) if s is not None else mx.zeros((acc.in_dim,))
+                                     for s in acc.expert_sums]) / mx.maximum(acc.count, 1.0)[:, None])
+                    oqp, oqs, oqb = oq._quantize_chunked(wf, gs, bits, "affine", importance=imp)
+                    oqe_deq = mx.dequantize(oqp, oqs, oqb, group_size=gs, bits=bits)
+                    info["err_oqe"] = _relative_output_error(wf, oqe_deq, acc, prior_tokens, expert_chunk)
+                    del oqp, oqs, oqb, oqe_deq
+                tensors[f"{full}.weight"], tensors[f"{full}.scales"], tensors[f"{full}.biases"] = qw, sc, bi
+                info_by_base[full] = info
+                module.weight = deq.astype(w.dtype)
+                mx.eval(module.weight)
+                mx.clear_cache()
+            del collector
+            meta = {"layer": layer_idx, "tensors": info_by_base, "skipped": skipped,
+                    "seconds": round(time.monotonic() - t_layer, 1)}
+            cache.save(layer_idx, digest, tensors, meta)
+            del tensors
+
+        # Propagate the *quantized* block's output to the next block.
+        forward_all(block, layer_idx)
+        layers_meta[layer_idx] = meta
+        prev_digest = digest
+        del block
+        mx.synchronize()
+        mx.clear_cache()
+        done = layer_idx + 1
+        msg = (f"oQ-T sweep: layer {done}/{total_layers or '?'} "
+               f"({time.monotonic() - t_start:.0f}s elapsed)")
+        logger.info(msg)
+        if progress_callback is not None:
+            frac = done / total_layers if total_layers else 1.0
+            try:
+                progress_callback("oqt", 18.0 + 2.0 * frac, msg)
+            except TypeError:
+                progress_callback("oqt", 18.0 + 2.0 * frac)
+
+    return OQTResults(cache, layers_meta)

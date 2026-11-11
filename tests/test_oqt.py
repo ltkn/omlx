@@ -161,9 +161,46 @@ def test_experts_wrapper_matches_manual_chunks():
     ids = mx.random.randint(0, E, (200, 2), key=mx.random.key(12))
     acc = oqt.HessianAccumulator(D, batch=E)
     acc.add_routed(x, ids)
-    p, s, b = oqt.gptq_quantize_experts(w, acc.sum_xxT, acc.count, bits, gs, expert_chunk=2)
+    p, s, b = oqt.gptq_quantize_experts(w, acc, bits, gs, expert_chunk=2)
     assert p.shape[0] == E
     h = oqt.shrink_expert_hessians(acc.sum_xxT, acc.count)
     p2, s2, b2 = oqt.gptq_quantize(w, h, bits, gs)
     np.testing.assert_allclose(np.array(_deq(p, s, b, gs, bits)),
                                np.array(_deq(p2, s2, b2, gs, bits)), atol=1e-6)
+
+
+def test_pair_level_accumulator_and_collector_paths():
+    """down_proj receives one row per (token, expert) pair, not per token."""
+    E, T, K, D = 5, 30, 2, 16
+    ids = mx.random.randint(0, E, (T, K), key=mx.random.key(30))
+    x_pairs = mx.random.normal((T * K, D), key=mx.random.key(31))
+    acc = oqt.HessianAccumulator(D, batch=E)
+    acc.add_pairs(x_pairs, ids.reshape(-1))
+    xn, idn = np.array(x_pairs), np.array(ids).reshape(-1)
+    for e in range(E):
+        rows = xn[idn == e]
+        np.testing.assert_allclose(np.array(acc.sum_xxT[e]), rows.T @ rows, rtol=1e-4, atol=1e-4)
+
+    # Collector: token-level vs pair-level inputs are told apart by row count.
+    class _Switch:
+        def __init__(self, din):
+            self.weight = mx.zeros((E, 8, din))
+            self.num_experts, self.input_dims = E, din
+
+    col = oqt.OQTHessianCollector()
+    x_tok = mx.random.normal((T, D), key=mx.random.key(32))
+    col.collect_switch("gate", _Switch(D), x_tok, ids)
+    col.end_forward()
+    col.collect_switch("down", _Switch(D), x_pairs, ids)
+    col.end_forward()
+    assert col.accumulator("gate").counts.sum() == T * K
+    assert col.accumulator("down").counts.sum() == T * K
+    # Same input object for two compatible switch modules -> shared accumulator.
+    col.collect_switch("g2", _Switch(D), x_tok, ids)
+    col.collect_switch("u2", _Switch(D), x_tok, ids)
+    assert col.accumulator("u2") is col.accumulator("g2")
+    # A dense module fed the same array must NOT share the experts' accumulator.
+    class _Dense:
+        weight = mx.zeros((8, D))
+    col.collect_dense("shared_expert", _Dense(), x_tok)
+    assert col.accumulator("shared_expert").batch == 0

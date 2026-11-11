@@ -6955,6 +6955,9 @@ def quantize_oq_streaming(
     calib_dataset: str | None = None,
     sensitivity_calib_dataset: str | None = None,
     ngram_bits: int | None = None,
+    teacher_matched: bool = False,
+    oqt_cache_path: str = "",
+    oqt_options: dict | None = None,
 ) -> None:
     """Tensor-by-tensor quantization. Memory: ~3-4GB regardless of model size.
 
@@ -7048,6 +7051,17 @@ def quantize_oq_streaming(
             at least 4 bits, e.g. Q8 at oQ4e). Pass 8 to keep the table at
             Q8 group-32 affine while the rest of the model follows the oQ
             level. Cannot be combined with preserve_ngram_table.
+        teacher_matched: oQ-T (see omlx/oqt.py). After the quant plan is
+            built, run one extra streamed sweep that quantizes every decoder
+            block with GPTQ error feedback against the full input Hessian,
+            feeding each block the *quantized* output of the block before it.
+            The writer takes those tensors and falls back to oQe for the rest,
+            so pass enhanced=True too. Writes oqt_report.json (oQ-T vs oQe
+            output error per tensor) into the output.
+        oqt_cache_path: Directory for the per-layer oQ-T cache (resumable).
+            Default: ``<output>.oqt-cache`` next to the output.
+        oqt_options: Extra keyword arguments for oqt.run_streaming_sweep
+            (prior_tokens, damp, group_params, expert_chunk, compare_oqe).
     """
     if oq_level not in OQ_LEVELS:
         raise ValueError(
@@ -7674,6 +7688,26 @@ def quantize_oq_streaming(
     else:
         config["_oq_boost_map"] = {}
 
+    oqt_results = None
+    if teacher_matched:
+        from . import oqt as _oqt
+
+        cb("oqt", 18.0, "oQ-T: streamed GPTQ sweep")
+        oqt_results = _oqt.run_streaming_sweep(
+            model_path,
+            config,
+            oq_level,
+            group_size,
+            cache_dir=oqt_cache_path or str(output.parent / f"{output.name}.oqt-cache"),
+            calib_dataset=calib_dataset or _OQE_CALIB_DATASET,
+            num_samples=int(imatrix_num_samples),
+            seq_length=int(imatrix_seq_length),
+            target_dtype=target_dtype,
+            trust_remote_code=trust_remote_code,
+            progress_callback=progress_callback,
+            **(oqt_options or {}),
+        )
+
     cb("loading", 20.0, "Starting tensor quantization")
 
     tensor_names = list(all_weights.keys())
@@ -7804,23 +7838,29 @@ def quantize_oq_streaming(
                         and w_mx.dtype != target_dtype
                     ):
                         w_mx = w_mx.astype(target_dtype)
-                    importance = None
-                    if imatrix_data is not None and qmode == "affine":
-                        importance = _lookup_imatrix_importance(
-                            imatrix_data,
-                            tensor_name,
-                            tuple(shape),
-                            config=config,
-                            strict=imatrix_strict,
-                            report=imatrix_report,
+                    oqt_hit = None
+                    if oqt_results is not None and qmode == "affine":
+                        oqt_hit = oqt_results.lookup(tensor_name, bits, gs, tuple(shape))
+                    if oqt_hit is not None:
+                        qw, scales, biases = oqt_hit
+                    else:
+                        importance = None
+                        if imatrix_data is not None and qmode == "affine":
+                            importance = _lookup_imatrix_importance(
+                                imatrix_data,
+                                tensor_name,
+                                tuple(shape),
+                                config=config,
+                                strict=imatrix_strict,
+                                report=imatrix_report,
+                            )
+                        qw, scales, biases = _quantize_chunked(
+                            w_mx,
+                            gs,
+                            bits,
+                            qmode,
+                            importance=importance,
                         )
-                    qw, scales, biases = _quantize_chunked(
-                        w_mx,
-                        gs,
-                        bits,
-                        qmode,
-                        importance=importance,
-                    )
 
                     base = tensor_name
                     if base.endswith(".weight"):
@@ -8034,6 +8074,9 @@ def quantize_oq_streaming(
             imatrix_report[key] = sorted(set(imatrix_report[key]))
         with open(output / "oq_imatrix_report.json", "w") as f:
             json.dump(imatrix_report, f, indent=2, ensure_ascii=False)
+    if oqt_results is not None:
+        with open(output / "oqt_report.json", "w") as f:
+            json.dump(oqt_results.report(), f, indent=2, ensure_ascii=False)
 
     _copy_model_sidecars(source, output, text_only=text_only)
     for name in DECISION_SIDECAR_FILES:
