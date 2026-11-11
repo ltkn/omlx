@@ -261,3 +261,43 @@ def test_writer_resume_starts_over_when_inputs_change(checkpoint, tmp_path, monk
     _build(source, out, tmp_path / "cache", resume_writer=True)
     assert not (out / oqt.WriterJournal.NAME).exists()
     assert not (out / "model-00001-of-PLACEHOLDER.safetensors").exists()
+
+
+class _CharTok:
+    """Tiny stand-in tokenizer for long-window packing (ids fit a 64-token vocab)."""
+
+    def encode(self, text):
+        return [1 + (ord(c) % 60) for c in text]
+
+
+def test_long_windows_pack_whole_documents_and_build(checkpoint, tmp_path, monkeypatch):
+    from mlx_vlm.utils import load_model
+    from omlx.patches.mlx_vlm_qwen4_exp_compat import configure_qwen4_exp_runtime
+    from omlx import oqt
+
+    source, tokens = checkpoint
+    monkeypatch.setattr("mlx_lm.tokenizer_utils.load", lambda *a, **kw: _CharTok())
+    docs = tmp_path / "long.jsonl"
+    docs.write_text("".join(json.dumps({"text": f"session {i}: " + "abc " * 10}) + "\n" for i in range(6)))
+
+    # Packing: every window starts at a document start and has exactly `length` tokens.
+    w = oqt._pack_long_windows(_CharTok(), str(docs), 16, 3, seed=0)
+    assert w.shape == (3, 16)
+    starts = {tuple(_CharTok().encode(json.loads(l)["text"])[:16]) for l in docs.read_text().splitlines()}
+    assert all(tuple(row.tolist()) in starts for row in w)
+
+    out = tmp_path / "out"
+    _build(source, out, tmp_path / "cache", oqt_options={
+        "long_calib_path": str(docs), "long_seq_length": 16, "long_share": 0.5})
+    cal = json.loads((out / "oqt_report.json").read_text())["summary"]["calibration_windows"]
+    assert cal["long_windows"] == 1 and cal["long_len"] == 16 and cal["short_windows"] == 2, cal
+    configure_qwen4_exp_runtime(out, mode="resident", mtp_enabled=False)
+    loaded = load_model(out, lazy=True, strict=True)
+    assert mx.isfinite(loaded(tokens).logits).all().item()
+
+    # Changing the long-window settings invalidates the cached layers.
+    out2 = tmp_path / "out2"
+    _build(source, out2, tmp_path / "cache", oqt_options={
+        "long_calib_path": str(docs), "long_seq_length": 8, "long_share": 0.5})
+    rep2 = json.loads((out2 / "oqt_report.json").read_text())
+    assert not any(l.get("reused") for l in rep2["layers"].values())

@@ -785,6 +785,9 @@ class OQTResults:
             # carries most tokens, consistently across layers.
             summary["expert_tiering_signal"] = (
                 "strong" if top20 >= 0.6 else "moderate" if top20 >= 0.45 else "weak")
+        cal = getattr(self, "calibration", None)
+        if cal:
+            summary["calibration_windows"] = cal
         return {
             "version": OQT_VERSION,
             "summary": summary,
@@ -943,6 +946,34 @@ def _expert_usage(collector) -> dict:
     return {}
 
 
+def _pack_long_windows(tokenizer, path, length: int, count: int, seed: int):
+    """Pack whole documents (one JSON object with "text" per line) into windows of
+    exactly ``length`` tokens. Every window starts at a document's beginning;
+    documents are appended until the window is full, the tail is cut, and the
+    next window starts at the next document. Returns [n, length] or None."""
+    docs = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                docs.append(json.loads(line)["text"])
+    docs.sort(key=lambda d: hashlib.sha256(f"{seed}|{d[:200]}|{len(d)}".encode()).hexdigest())
+    windows, cur = [], []
+    for doc in docs:
+        ids = tokenizer.encode(doc)
+        if hasattr(ids, "input_ids"):
+            ids = ids.input_ids
+        cur.extend(int(i) for i in ids)
+        if len(cur) >= length:
+            windows.append(cur[:length])
+            cur = []
+            if len(windows) >= count:
+                break
+    if not windows:
+        return None
+    return mx.array(windows, dtype=mx.int32)
+
+
 def run_streaming_sweep(
     model_path: str,
     config: dict,
@@ -969,6 +1000,9 @@ def run_streaming_sweep(
     routing_mass_threshold: float = 0.02,
     routing_max_extra_bits: int = 2,
     routing_max_layers_frac: float = 0.25,
+    long_calib_path: str | None = None,
+    long_seq_length: int = 32768,
+    long_share: float = 0.25,
 ) -> OQTResults:
     """Run the oQ-T sweep and return the writer-side lookup.
 
@@ -989,61 +1023,96 @@ def run_streaming_sweep(
     source = Path(model_path)
     cache = OQTCache(cache_dir)
     seed = oq._OQE_STREAM_CALIB_SEED if calib_seed is None else int(calib_seed)
+    use_long = bool(long_calib_path) and long_share > 0 and Path(long_calib_path).exists()
+    tokenizer = load_tokenizer(source) if (calib_data is None or use_long) else None
     if calib_data is None:
-        tokenizer = load_tokenizer(source)
         mx.random.seed(seed)
         calib_data = oq._load_calibration_data(
             tokenizer, dataset=calib_dataset, num_samples=num_samples, seq_length=seq_length)
     if calib_data is None:
         raise RuntimeError(f"oQ-T: no calibration data from {calib_dataset!r}")
     calib_data = calib_data[:num_samples]
+    short_len = int(calib_data.shape[1])
+
+    # Long windows (whole documents packed from their start) take long_share of
+    # the same token total; the short windows shrink to keep the total fixed.
+    long_data = None
+    if use_long:
+        total_tokens = int(calib_data.shape[0]) * short_len
+        n_long = int(round(long_share * total_tokens / long_seq_length))
+        if n_long >= 1:
+            long_data = _pack_long_windows(tokenizer, long_calib_path, long_seq_length, n_long, seed)
+        if long_data is not None:
+            n_short = max(1, int(round((total_tokens - long_data.shape[0] * long_seq_length) / short_len)))
+            calib_data = calib_data[:n_short]
+            logger.info("oQ-T: %d long windows x %d tokens + %d short windows x %d tokens",
+                        long_data.shape[0], long_seq_length, n_short, short_len)
+        else:
+            logger.warning("oQ-T: long documents too few or too short for one %d-token window; "
+                           "calibrating on short windows only", long_seq_length)
     n_samples = int(calib_data.shape[0])
 
     batch_plan = oq._oqe_calibration_batch_plan(
-        config, requested_samples=n_samples, seq_length=int(calib_data.shape[1]))
+        config, requested_samples=n_samples, seq_length=short_len)
     micro = max(1, int(batch_plan["micro_batch_size"]))
-    ranges = [(lo, min(lo + micro, n_samples)) for lo in range(0, n_samples, micro)]
 
     is_qwen4_exp = model_type == "qwen4_exp"
     is_glm5_next = model_type == "glm5_next"
     if is_qwen4_exp:
         oq._qwen4_exp_apply_compat_patch()
     embed_weight = oq._streamed_embed_weight(source, config)
-    embedded = oq._streamed_embed(embed_weight, calib_data, config)
-    mx.eval(embedded)
+
+    # Each stream (short windows, long windows) gets its own embedding, masks
+    # and positions; the sweep then iterates a flat list of slots.
+    working, slots = [], []
+
+    def add_stream(data, micro_size, kind):
+        embedded = oq._streamed_embed(embed_weight, data, config)
+        mx.eval(embedded)
+        n = int(data.shape[0])
+        ranges = [(lo, min(lo + micro_size, n)) for lo in range(0, n, micro_size)]
+        if is_qwen4_exp:
+            embedded, layer_masks, pos = oq._streamed_qwen4_exp_state(config, data, embedded)
+            mx.eval(embedded)
+            for lo, hi in ranges:
+                working.append(embedded[lo:hi])
+                slots.append({"kind": kind, "layer_masks": layer_masks,
+                              "state": oq._streamed_qwen4_exp_slot_state(data, pos, lo, hi)})
+        elif is_glm5_next:
+            embedded, m_ = oq._streamed_glm5_next_state(config, embedded)
+            mx.eval(embedded)
+            for lo, hi in ranges:
+                working.append(embedded[lo:hi])
+                slots.append({"kind": kind, "mask": m_, "glm5": True,
+                              "state": {"kind": oq._GLM5_NEXT_LAYER_STATE_KIND}})
+        elif model_type == "flint":
+            for lo, hi in ranges:
+                working.append(embedded[lo:hi])
+                slots.append({"kind": kind, "mask": None,
+                              "state": {"kind": oq._FLINT_LAYER_STATE_KIND}})
+        else:
+            _, lm, pos = oq._prepare_layer_inputs(
+                oq._StreamingNoModel(), [None], data[:1], embedded[:1],
+                noncausal=oq._noncausal_attention(config))
+            for lo, hi in ranges:
+                working.append(embedded[lo:hi])
+                slots.append({"kind": kind, "mask": lm[0], "state": pos})
+
+    add_stream(calib_data, micro, "short")
+    if long_data is not None:
+        add_stream(long_data, 1, "long")
     del embed_weight
     mx.clear_cache()
-
-    slot_states = None
-    if is_qwen4_exp:
-        embedded, q4_layer_masks, q4_position_ids = oq._streamed_qwen4_exp_state(
-            config, calib_data, embedded)
-        mx.eval(embedded)
-        slot_states = [oq._streamed_qwen4_exp_slot_state(calib_data, q4_position_ids, lo, hi)
-                       for lo, hi in ranges]
-        mask = position_ids = None
-    elif is_glm5_next:
-        embedded, mask = oq._streamed_glm5_next_state(config, embedded)
-        mx.eval(embedded)
-        position_ids = {"kind": oq._GLM5_NEXT_LAYER_STATE_KIND}
-    elif model_type == "flint":
-        mask, position_ids = None, {"kind": oq._FLINT_LAYER_STATE_KIND}
-    else:
-        _, layer_masks, position_ids = oq._prepare_layer_inputs(
-            oq._StreamingNoModel(), [None], calib_data[:1], embedded[:1],
-            noncausal=oq._noncausal_attention(config))
-        mask = layer_masks[0]
-
-    working = [embedded[lo:hi] for lo, hi in ranges]
-    del embedded
 
     settings = {
         "version": OQT_VERSION, "source": str(source.resolve()),
         "calib": _file_digest(calib_dataset), "calib_name": str(calib_dataset),
-        "samples": n_samples, "seq_length": int(calib_data.shape[1]), "seed": seed,
+        "samples": n_samples, "seq_length": short_len, "seed": seed,
         "oq_level": float(oq_level), "group_size": int(group_size),
         "dtype": str(target_dtype), "prior_tokens": prior_tokens, "damp": damp,
         "group_params": group_params,
+        "long": ([_file_digest(long_calib_path), int(long_seq_length), float(long_share),
+                  int(long_data.shape[0])] if long_data is not None else None),
         "refine": [int(refine_sweeps), int(refine_expert_sweeps)],
         "routing": [bool(routing_protect), float(routing_mass_threshold),
                     int(routing_max_extra_bits), float(routing_max_layers_frac)],
@@ -1063,11 +1132,16 @@ def run_streaming_sweep(
 
     def forward_all(block, layer_idx, collector=None, tap=None, commit=True):
         """Forward every slot; commit=False returns the outputs instead of storing them."""
-        layer_mask = q4_layer_masks[layer_idx] if is_qwen4_exp else (
-            None if is_glm5_next and bool(getattr(block, "is_linear", False)) else mask)
         outs = []
         for slot in range(len(working)):
-            state = slot_states[slot] if slot_states is not None else position_ids
+            sl = slots[slot]
+            if "layer_masks" in sl:
+                layer_mask = sl["layer_masks"][layer_idx]
+            elif sl.get("glm5") and bool(getattr(block, "is_linear", False)):
+                layer_mask = None
+            else:
+                layer_mask = sl["mask"]
+            state = sl["state"]
             if tap is not None:
                 tap.slot = slot
             out, _ = oq._forward_layer_result(block, working[slot], layer_mask, state,
@@ -1275,7 +1349,12 @@ def run_streaming_sweep(
             except TypeError:
                 progress_callback("oqt", 18.0 + 2.0 * frac)
 
-    return OQTResults(cache, layers_meta)
+    results = OQTResults(cache, layers_meta)
+    results.calibration = {
+        "short_windows": int(calib_data.shape[0]), "short_len": short_len,
+        "long_windows": int(long_data.shape[0]) if long_data is not None else 0,
+        "long_len": int(long_seq_length) if long_data is not None else 0}
+    return results
 
 
 # ===========================================================================
