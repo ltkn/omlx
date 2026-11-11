@@ -323,6 +323,65 @@ def _batched_output_error(w, wq, h):
     return mx.sum((d @ h) * d, axis=(-2, -1))
 
 
+def refine_codes(W, H, codes, scales, biases, bits, group_size, *, sweeps=1, block_size=128):
+    """M6: coordinate-descent refinement of integer codes (scales/biases fixed).
+
+    Minimizes the exact layer output error ``tr((Q-W) H (Q-W)ᵀ)``. Rows are
+    independent, so every row (and every expert) is refined in parallel; within
+    a row, columns are visited in order and each code moves by ±1 only when
+    that strictly lowers the loss, so the result is never worse than the input.
+    Updates to the gradient ``G = (Q-W) H`` are applied lazily per column block,
+    like GPTQ, so one sweep costs about as much as one GPTQ pass.
+
+    Shapes: ``W, codes [B, out, in]``, ``H [B, in, in]``, ``scales/biases
+    [B, out, in/group_size]``. Returns refined codes (uint8) and the number of
+    codes changed.
+    """
+    B, out_dim, in_dim = W.shape
+    n_bins = float((1 << bits) - 1)
+    C = codes.astype(mx.float32)
+    S = mx.repeat(scales, group_size, axis=-1)                 # [B, out, in]
+    Bi = mx.repeat(biases, group_size, axis=-1)
+    E = C * S + Bi - W                                         # Q - W
+    G = E @ H                                                  # [B, out, in]
+    Hd = mx.diagonal(H, axis1=-2, axis2=-1)                    # [B, in]
+    changed = 0
+    for _ in range(max(0, int(sweeps))):
+        for i1 in range(0, in_dim, block_size):
+            i2 = min(i1 + block_size, in_dim)
+            Gb = G[:, :, i1:i2]
+            Hb = H[:, i1:i2, i1:i2]
+            D = mx.zeros((B, out_dim, i2 - i1), dtype=mx.float32)
+            for j in range(i2 - i1):
+                col = i1 + j
+                s = S[:, :, col]
+                g = Gb[:, :, j]
+                hjj = Hd[:, col][:, None]
+                c = C[:, :, col]
+                gain_up = 2.0 * s * g + s * s * hjj             # loss change for +1
+                gain_dn = -2.0 * s * g + s * s * hjj            # loss change for -1
+                up_ok = (c + 1 <= n_bins) & (gain_up < -1e-12)
+                dn_ok = (c - 1 >= 0) & (gain_dn < -1e-12)
+                take_up = up_ok & (~dn_ok | (gain_up <= gain_dn))
+                take_dn = dn_ok & ~take_up
+                delta = mx.where(take_up, 1.0, mx.where(take_dn, -1.0, 0.0))
+                step = delta * s                                # change of Q[:, :, col]
+                C[:, :, col] = c + delta
+                D[:, :, j] = step
+                Gb = Gb + step[:, :, None] * Hb[:, j, :][:, None, :]
+                if j % 32 == 31:
+                    mx.eval(C, D, Gb)
+            # Propagate this block's changes to the gradient outside the block.
+            G[:, :, i1:i2] = Gb
+            if i1 > 0:
+                G[:, :, :i1] = G[:, :, :i1] + D @ H[:, i1:i2, :i1]
+            if i2 < in_dim:
+                G[:, :, i2:] = G[:, :, i2:] + D @ H[:, i1:i2, i2:]
+            changed += int(mx.sum(D != 0).item())
+            mx.eval(C, G)
+    return C.astype(mx.uint8), changed
+
+
 def gptq_quantize(
     w: mx.array,
     h: mx.array,
@@ -333,6 +392,7 @@ def gptq_quantize(
     block_size: int = 128,
     store_dtype=mx.bfloat16,
     group_params: str = "best",
+    refine_sweeps: int = 1,
 ):
     """Quantize ``w[..., out, in]`` against Hessian ``h[..., in, in]`` with GPTQ.
 
@@ -389,6 +449,17 @@ def gptq_quantize(
     if group_params in ("dynamic", "best"):
         candidates.append(_gptq_core(mx.array(W0), U, imp_all, bits, group_size,
                                      block_size, store_dtype))
+
+    if refine_sweeps > 0:
+        # M6: polish every candidate against the exact (undamped) objective
+        # before choosing, so "best" stays never worse than either variant.
+        refined = []
+        for c, sc, bi in candidates:
+            c2, n_changed = refine_codes(W0, H_err, c, sc, bi, bits, group_size,
+                                         sweeps=refine_sweeps, block_size=block_size)
+            logger.debug("oQ-T: refinement changed %d codes", n_changed)
+            refined.append((c2, sc, bi))
+        candidates = refined
 
     codes, scales, biases = candidates[0]
     if len(candidates) == 2:
@@ -667,19 +738,24 @@ class OQTResults:
         if hit is None:
             return None
         layer_idx, info = hit
-        if info["bits"] != bits or info["group_size"] != group_size:
+        cached_bits = int(info["bits"])
+        # A routing-protection upgrade (M4) deliberately differs from the plan;
+        # anything else that differs means the plan changed since the sweep.
+        planned_ok = cached_bits == bits or (info.get("bits_override")
+                                             and info.get("planned_bits") == bits)
+        if not planned_ok or info["group_size"] != group_size:
             self.declined.append({"tensor": base, "reason": "plan changed",
-                                  "cached": [info["bits"], info["group_size"]],
+                                  "cached": [cached_bits, info["group_size"]],
                                   "writer": [bits, group_size]})
             return None
         t = self._tensors(layer_idx)
         qw, scales, biases = t[f"{base}.weight"], t[f"{base}.scales"], t[f"{base}.biases"]
-        if tuple(qw.shape) != _packed_shape(tuple(shape), bits):
+        if tuple(qw.shape) != _packed_shape(tuple(shape), cached_bits):
             self.declined.append({"tensor": base, "reason": "shape mismatch",
                                   "cached": list(qw.shape), "writer": list(shape)})
             return None
         self.used.append(base)
-        return qw, scales, biases
+        return qw, scales, biases, cached_bits
 
     def report(self) -> dict:
         per_tensor = {}
@@ -696,6 +772,19 @@ class OQTResults:
                 "mean_err_ratio_oqt_vs_oqe": float(np.mean(ratio)),
                 "share_tensors_improved": float(np.mean(ratio < 1.0)),
             }
+        routes = [m["routing"] for m in self.layers.values() if m.get("routing")]
+        if routes:
+            summary["routing_mass_shift_median"] = float(np.median([r["mass_shift"] for r in routes]))
+            summary["routing_layers_upgraded"] = sum(1 for r in routes if r.get("upgraded"))
+            summary["routing_tensors_upgraded"] = sum(len(r.get("upgraded") or {}) for r in routes)
+        usage = [m["expert_usage"] for m in self.layers.values() if m.get("expert_usage")]
+        if usage:
+            top20 = float(np.median([u["top20pct_share"] for u in usage]))
+            summary["expert_top20pct_share_median"] = top20
+            # M5 decision aid: tiers pay off only when a minority of experts
+            # carries most tokens, consistently across layers.
+            summary["expert_tiering_signal"] = (
+                "strong" if top20 >= 0.6 else "moderate" if top20 >= 0.45 else "weak")
         return {
             "version": OQT_VERSION,
             "summary": summary,
@@ -729,6 +818,131 @@ def _relative_output_error(w: mx.array, wq: mx.array, acc: HessianAccumulator,
     return num / max(den, 1e-12)
 
 
+_BITS_LADDER = (2, 3, 4, 5, 6, 8)
+
+
+def _bits_up(bits: int, steps: int) -> int:
+    """Next valid MLX affine bit width ``steps`` rungs above ``bits`` (capped at 8)."""
+    if steps <= 0:
+        return bits
+    higher = [b for b in _BITS_LADDER if b > bits]
+    return higher[min(steps, len(higher)) - 1] if higher else bits
+
+
+def _find_router(block):
+    """The MoE router of a decoder block: a 2-D Linear named ``gate`` whose parent
+    also holds the routed experts (``switch_mlp``/``experts``). None for dense blocks."""
+    for name, module in block.named_modules():
+        if not name or name.split(".")[-1] != "gate":
+            continue
+        parent_name = name.rsplit(".", 1)[0] if "." in name else ""
+        parent = _resolve_module(block, parent_name) if parent_name else block
+        has_experts = any(hasattr(parent, k) for k in ("switch_mlp", "experts"))
+        w = getattr(module, "weight", None)
+        if has_experts and w is not None and getattr(w, "ndim", 0) == 2:
+            return (parent, "gate", module, parent_name + "." if parent_name else "")
+    return None
+
+
+class _RouterTap:
+    """Records the router's top-k experts per token, for teacher and student forwards."""
+
+    def __init__(self, k: int):
+        self.k = int(k)
+        self.teacher: dict[int, tuple] = {}
+        self.student: dict[int, mx.array] = {}
+        self.record_as = "teacher"
+        self.slot = 0
+        self._attached = None
+        self.parent_prefix = ""
+
+    def attach(self, router):
+        parent, attr, original, parent_prefix = router
+        self.parent_prefix = parent_prefix
+        tap = self
+
+        def wrapped_call(x, *a, **kw):
+            logits = original(x, *a, **kw)
+            tap._record(logits)
+            return logits
+
+        proxy = _CallProxy(original, wrapped_call)
+        setattr(parent, attr, proxy)
+        self._attached = (parent, attr, original)
+
+    def detach(self):
+        if self._attached is not None:
+            parent, attr, original = self._attached
+            # MLX modules are dicts: the proxy was stored as an instance attribute
+            # shadowing the module entry, so remove it, then restore the entry.
+            parent.__dict__.pop(attr, None)
+            setattr(parent, attr, original)
+            self._attached = None
+
+    def reset_student(self):
+        self.student = {}
+
+    def _record(self, logits):
+        lg = logits.astype(mx.float32).reshape(-1, logits.shape[-1])
+        k = min(self.k, lg.shape[-1])
+        idx = mx.argpartition(-lg, kth=k - 1, axis=-1)[:, :k]
+        if self.record_as == "teacher":
+            probs = mx.softmax(lg, axis=-1)
+            p = mx.take_along_axis(probs, idx, axis=-1)
+            p = p / mx.maximum(p.sum(axis=-1, keepdims=True), 1e-12)
+            mx.eval(idx, p)
+            self.teacher[self.slot] = (idx, p)
+        else:
+            mx.eval(idx)
+            self.student[self.slot] = idx
+
+    def shift(self) -> tuple[float, float]:
+        """(routing mass moved to other experts, share of tokens with any change)."""
+        mass_sum = flip_sum = n = 0.0
+        for slot, (t_idx, t_p) in self.teacher.items():
+            s_idx = self.student.get(slot)
+            if s_idx is None:
+                continue
+            kept = mx.any(t_idx[:, :, None] == s_idx[:, None, :], axis=-1)
+            dropped = mx.sum(t_p * (1.0 - kept.astype(mx.float32)), axis=-1)
+            mass_sum += float(mx.sum(dropped).item())
+            flip_sum += float(mx.sum(mx.any(~kept, axis=-1).astype(mx.float32)).item())
+            n += t_idx.shape[0]
+        return (mass_sum / n, flip_sum / n) if n else (0.0, 0.0)
+
+
+class _CallProxy:
+    """Stands in for a module during a forward: calls go through ``fn``,
+    attribute reads reach the original module."""
+
+    def __init__(self, original, fn):
+        object.__setattr__(self, "_original", original)
+        object.__setattr__(self, "_fn", fn)
+
+    def __call__(self, *a, **kw):
+        return object.__getattribute__(self, "_fn")(*a, **kw)
+
+    def __getattr__(self, key):
+        return getattr(object.__getattribute__(self, "_original"), key)
+
+
+def _expert_usage(collector) -> dict:
+    """M5 measurement: how unevenly the block's tokens use its experts."""
+    for acc in collector.hessians.values():
+        if acc.batch and acc.counts.sum() > 0:
+            c = np.sort(acc.counts.astype(np.float64))[::-1]
+            p = c / c.sum()
+            nz = p[p > 0]
+            entropy = float(-(nz * np.log(nz)).sum() / np.log(len(p))) if len(p) > 1 else 1.0
+            k10 = max(1, int(round(0.10 * len(p))))
+            k20 = max(1, int(round(0.20 * len(p))))
+            return {"experts": int(len(p)), "entropy_norm": round(entropy, 4),
+                    "top10pct_share": round(float(p[:k10].sum()), 4),
+                    "top20pct_share": round(float(p[:k20].sum()), 4),
+                    "unseen": int((c == 0).sum())}
+    return {}
+
+
 def run_streaming_sweep(
     model_path: str,
     config: dict,
@@ -749,6 +963,12 @@ def run_streaming_sweep(
     group_params: str = "best",
     expert_chunk: int = 32,
     compare_oqe: bool = True,
+    refine_sweeps: int = 1,
+    refine_expert_sweeps: int = 0,
+    routing_protect: bool = True,
+    routing_mass_threshold: float = 0.02,
+    routing_max_extra_bits: int = 2,
+    routing_max_layers_frac: float = 0.25,
 ) -> OQTResults:
     """Run the oQ-T sweep and return the writer-side lookup.
 
@@ -824,6 +1044,9 @@ def run_streaming_sweep(
         "oq_level": float(oq_level), "group_size": int(group_size),
         "dtype": str(target_dtype), "prior_tokens": prior_tokens, "damp": damp,
         "group_params": group_params,
+        "refine": [int(refine_sweeps), int(refine_expert_sweeps)],
+        "routing": [bool(routing_protect), float(routing_mass_threshold),
+                    int(routing_max_extra_bits), float(routing_max_layers_frac)],
     }
     prev_digest = hashlib.sha256(json.dumps(settings, sort_keys=True).encode()).hexdigest()
 
@@ -833,11 +1056,20 @@ def run_streaming_sweep(
     layers_meta: dict[int, dict] = {}
     t_start = time.monotonic()
 
-    def forward_all(block, layer_idx, collector=None):
+    top_k = int(text_config.get("num_experts_per_tok") or config.get("num_experts_per_tok")
+                or text_config.get("moe_top_k") or config.get("moe_top_k") or 0)
+    max_upgraded_layers = max(0, int(np.ceil(routing_max_layers_frac * max(total_layers, 1))))
+    upgraded_layers = 0
+
+    def forward_all(block, layer_idx, collector=None, tap=None, commit=True):
+        """Forward every slot; commit=False returns the outputs instead of storing them."""
         layer_mask = q4_layer_masks[layer_idx] if is_qwen4_exp else (
             None if is_glm5_next and bool(getattr(block, "is_linear", False)) else mask)
+        outs = []
         for slot in range(len(working)):
             state = slot_states[slot] if slot_states is not None else position_ids
+            if tap is not None:
+                tap.slot = slot
             out, _ = oq._forward_layer_result(block, working[slot], layer_mask, state,
                                               layer_idx=layer_idx)
             if out is None:
@@ -845,8 +1077,11 @@ def run_streaming_sweep(
             mx.eval(out)
             if collector is not None:
                 collector.end_forward()
-            else:
+            elif commit:
                 working[slot] = out
+            else:
+                outs.append(out)
+        return outs
 
     for layer_idx, block, _is_moe in oq._iter_streamed_layer_blocks(
         source, config, trust_remote_code=trust_remote_code
@@ -877,42 +1112,54 @@ def run_streaming_sweep(
                     tensors[f"{base}.weight"], tensors[f"{base}.scales"], tensors[f"{base}.biases"],
                     group_size=info["group_size"], bits=info["bits"]).astype(module.weight.dtype)
             meta["reused"] = True
+            if meta.get("routing", {}).get("upgraded"):
+                upgraded_layers += 1
             logger.info("oQ-T: layer %d reused from cache", layer_idx)
+            forward_all(block, layer_idx)
         else:
+            router = _find_router(block) if (routing_protect and top_k > 0) else None
+            tap = _RouterTap(top_k) if router is not None else None
             collector = OQTHessianCollector(skip=skip)
             collector.install(block, prefix)
+            if tap is not None:
+                tap.attach(router)
+                tap.record_as = "teacher"
             try:
                 forward_all(block, layer_idx, collector)
             finally:
                 collector.restore(block)
+                if tap is not None:
+                    tap.detach()
 
+            originals = {rel: getattr(m, "weight", None) for rel, m in modules.items()}
             tensors, info_by_base, skipped = {}, {}, {}
-            for rel, module in modules.items():
+
+            def quantize_one(rel, bits):
+                """Quantize one capture module at ``bits``; returns its info or a skip reason."""
+                module = modules[rel]
                 full = prefix + rel
-                bits, gs, mode = plan[rel]
+                _, gs, mode = plan[rel]
                 acc = collector.accumulator(full)
-                w = getattr(module, "weight", None)
-                reason = None
+                w = originals[rel]
                 if bits is None or mode != "affine":
-                    reason = f"plan: bits={bits} mode={mode}"
-                elif acc is None:
-                    reason = "no activations captured"
-                elif full in collector.unsupported:
-                    reason = "unsupported module kind"
-                elif w is None or not mx.issubdtype(w.dtype, mx.floating):
-                    reason = "pre-quantized source tensor"
-                elif w.shape[-1] % gs:
-                    reason = "in_dim not a multiple of group size"
-                if reason:
-                    skipped[full] = reason
-                    continue
+                    return None, f"plan: bits={bits} mode={mode}"
+                if acc is None:
+                    return None, "no activations captured"
+                if full in collector.unsupported:
+                    return None, "unsupported module kind"
+                if w is None or not mx.issubdtype(w.dtype, mx.floating):
+                    return None, "pre-quantized source tensor"
+                if w.shape[-1] % gs:
+                    return None, "in_dim not a multiple of group size"
                 wf = w.astype(target_dtype)
                 kw = dict(damp=damp, store_dtype=target_dtype, group_params=group_params)
                 if acc.batch:
-                    qw, sc, bi = gptq_quantize_experts(wf, acc, bits, gs, prior_tokens=prior_tokens,
-                                                       expert_chunk=expert_chunk, **kw)
+                    qw, sc, bi = gptq_quantize_experts(
+                        wf, acc, bits, gs, prior_tokens=prior_tokens, expert_chunk=expert_chunk,
+                        refine_sweeps=refine_expert_sweeps, **kw)
                 else:
-                    qw, sc, bi = gptq_quantize(wf, acc.layer_mean(), bits, gs, **kw)
+                    qw, sc, bi = gptq_quantize(wf, acc.layer_mean(), bits, gs,
+                                               refine_sweeps=refine_sweeps, **kw)
                 deq = mx.dequantize(qw, sc, bi, group_size=gs, bits=bits)
                 info = {"bits": int(bits), "group_size": int(gs), "shape": list(w.shape),
                         "tokens": float(acc.counts.sum()) if acc.batch else float(acc.counts)}
@@ -923,8 +1170,8 @@ def run_streaming_sweep(
                 if compare_oqe:
                     info["err_oqt"] = _relative_output_error(wf, deq, acc, prior_tokens, expert_chunk)
                     imp = (mx.diagonal(acc.layer_mean()) if not acc.batch else
-                           mx.stack([mx.diagonal(s) if s is not None else mx.zeros((acc.in_dim,))
-                                     for s in acc.expert_sums]) / mx.maximum(acc.count, 1.0)[:, None])
+                           mx.stack([mx.diagonal(s_) if s_ is not None else mx.zeros((acc.in_dim,))
+                                     for s_ in acc.expert_sums]) / mx.maximum(acc.count, 1.0)[:, None])
                     oqp, oqs, oqb = oq._quantize_chunked(wf, gs, bits, "affine", importance=imp)
                     oqe_deq = mx.dequantize(oqp, oqs, oqb, group_size=gs, bits=bits)
                     info["err_oqe"] = _relative_output_error(wf, oqe_deq, acc, prior_tokens, expert_chunk)
@@ -934,14 +1181,79 @@ def run_streaming_sweep(
                 module.weight = deq.astype(w.dtype)
                 mx.eval(module.weight)
                 mx.clear_cache()
+                return info, None
+
+            for rel in modules:
+                _, reason = quantize_one(rel, plan[rel][0])
+                if reason:
+                    skipped[prefix + rel] = reason
+
+            # Check the quantized block; the outputs become the next block's input.
+            routing = {}
+            if tap is not None:
+                tap.attach(router)
+                tap.record_as = "student"
+                tap.reset_student()
+            try:
+                outs = forward_all(block, layer_idx, commit=False)
+            finally:
+                if tap is not None:
+                    tap.detach()
+
+            if tap is not None and tap.teacher:
+                mass, flip = tap.shift()
+                routing = {"mass_shift": round(mass, 5), "flip_rate": round(flip, 5),
+                           "threshold": routing_mass_threshold}
+                router_parent = tap.parent_prefix
+                pre_router = [rel for rel in modules
+                              if not rel.startswith(router_parent) and prefix + rel in info_by_base]
+                if (mass > routing_mass_threshold and pre_router
+                        and upgraded_layers < max_upgraded_layers and routing_max_extra_bits > 0):
+                    base_bits = {rel: info_by_base[prefix + rel]["bits"] for rel in pre_router}
+                    best = (mass, {rel: base_bits[rel] for rel in pre_router}, outs)
+                    for extra in range(1, routing_max_extra_bits + 1):
+                        new_bits = {rel: _bits_up(base_bits[rel], extra) for rel in pre_router}
+                        for rel in pre_router:
+                            quantize_one(rel, new_bits[rel])
+                        tap.attach(router)
+                        tap.reset_student()
+                        try:
+                            trial = forward_all(block, layer_idx, commit=False)
+                        finally:
+                            tap.detach()
+                        m2, f2 = tap.shift()
+                        if m2 < best[0]:
+                            best = (m2, new_bits, trial)
+                        if m2 <= routing_mass_threshold:
+                            break
+                    # Re-apply the best configuration (the last trial may not be it).
+                    final_bits = best[1]
+                    for rel in pre_router:
+                        quantize_one(rel, final_bits[rel])
+                        if final_bits[rel] != base_bits[rel]:
+                            info_by_base[prefix + rel]["bits_override"] = True
+                            info_by_base[prefix + rel]["planned_bits"] = base_bits[rel]
+                    outs = best[2]   # outputs of exactly the re-applied configuration
+                    upgraded = {rel: [base_bits[rel], final_bits[rel]]
+                                for rel in pre_router if final_bits[rel] != base_bits[rel]}
+                    if upgraded:
+                        upgraded_layers += 1
+                    routing.update({"mass_shift_after": round(best[0], 5), "upgraded": upgraded})
+
+            for slot, out in enumerate(outs):
+                working[slot] = out
+
+            usage = _expert_usage(collector)
             del collector
             meta = {"layer": layer_idx, "tensors": info_by_base, "skipped": skipped,
                     "seconds": round(time.monotonic() - t_layer, 1)}
+            if routing:
+                meta["routing"] = routing
+            if usage:
+                meta["expert_usage"] = usage
             cache.save(layer_idx, digest, tensors, meta)
             del tensors
 
-        # Propagate the *quantized* block's output to the next block.
-        forward_all(block, layer_idx)
         layers_meta[layer_idx] = meta
         prev_digest = digest
         del block
@@ -950,6 +1262,11 @@ def run_streaming_sweep(
         done = layer_idx + 1
         msg = (f"oQ-T sweep: layer {done}/{total_layers or '?'} "
                f"({time.monotonic() - t_start:.0f}s elapsed)")
+        r = meta.get("routing") or {}
+        if r:
+            msg += f", routing shift {r.get('mass_shift', 0):.3f}"
+            if r.get("upgraded"):
+                msg += f" -> {r.get('mass_shift_after', 0):.3f} after +bits on {len(r['upgraded'])} tensors"
         logger.info(msg)
         if progress_callback is not None:
             frac = done / total_layers if total_layers else 1.0
@@ -959,3 +1276,70 @@ def run_streaming_sweep(
                 progress_callback("oqt", 18.0 + 2.0 * frac)
 
     return OQTResults(cache, layers_meta)
+
+
+# ===========================================================================
+# Writer resume
+# ===========================================================================
+
+
+class WriterJournal:
+    """Progress journal for oQ's tensor-by-tensor writer.
+
+    Written after every output shard: how many tensors (in the writer's
+    deterministic order) are fully inside written shards, the shard map, the
+    per-tensor quantization config, and report lists. A rerun with the same
+    inputs skips those tensors; a rerun with different inputs deletes the
+    stale shards and starts over. Removed when the build completes.
+    """
+
+    NAME = ".oq_writer_journal.json"
+
+    def __init__(self, output, digest: str):
+        self.output = Path(output)
+        self.path = self.output / self.NAME
+        self.digest = digest
+
+    def restore(self):
+        """Returns (tensors_done, shards_written, weight_map, per_layer_config, extra)."""
+        if not self.path.exists():
+            return 0, 0, {}, {}, {}
+        try:
+            state = json.loads(self.path.read_text())
+        except (OSError, ValueError):
+            state = {}
+        shards = sorted(set((state.get("weight_map") or {}).values()))
+        if state.get("digest") != self.digest or not all((self.output / s_).exists() for s_ in shards):
+            for s_ in shards:
+                (self.output / s_).unlink(missing_ok=True)
+            self.path.unlink(missing_ok=True)
+            logger.info("oQ writer: previous partial output does not match these inputs; starting over")
+            return 0, 0, {}, {}, {}
+        logger.info("oQ writer: resuming after %d tensors (%d shards already written)",
+                    state["tensors_done"], state["shards"])
+        return (int(state["tensors_done"]), int(state["shards"]), dict(state["weight_map"]),
+                dict(state["per_layer_config"]), dict(state.get("extra") or {}))
+
+    def record(self, tensors_done, shards, weight_map, per_layer_config, extra=None):
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({
+            "digest": self.digest, "tensors_done": int(tensors_done), "shards": int(shards),
+            "weight_map": weight_map, "per_layer_config": per_layer_config,
+            "extra": extra or {}}, default=str))
+        tmp.replace(self.path)
+
+    def finish(self):
+        self.path.unlink(missing_ok=True)
+
+
+def writer_digest(**parts) -> str:
+    """Identity of everything that decides the writer's output."""
+    norm = {}
+    for k, v in parts.items():
+        if isinstance(v, OQTResults):
+            v = sorted((b, i["bits"], i["group_size"]) for b, (_, i) in v.index.items())
+        elif isinstance(v, (str, Path)) and k.endswith("_path") and v and Path(v).exists():
+            st = Path(v).stat()
+            v = [str(v), st.st_size, int(st.st_mtime)]
+        norm[k] = v
+    return hashlib.sha256(json.dumps(norm, sort_keys=True, default=str).encode()).hexdigest()

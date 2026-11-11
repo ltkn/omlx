@@ -204,3 +204,40 @@ def test_pair_level_accumulator_and_collector_paths():
         weight = mx.zeros((8, D))
     col.collect_dense("shared_expert", _Dense(), x_tok)
     assert col.accumulator("shared_expert").batch == 0
+
+
+@pytest.mark.parametrize("bits", [3, 4])
+def test_refinement_never_worse_and_helps_on_correlated_inputs(bits):
+    gs = 64
+    w = (mx.random.normal((4, 64, 256), key=mx.random.key(40)) * 0.02).astype(mx.bfloat16)
+    hs = mx.stack([_hessian(_correlated_inputs(512, 256, seed=50 + e)) for e in range(4)])
+    p0, s0, b0 = oqt.gptq_quantize(w, hs, bits, gs, refine_sweeps=0)
+    p1, s1, b1 = oqt.gptq_quantize(w, hs, bits, gs, refine_sweeps=2)
+    d0, d1 = _deq(p0, s0, b0, gs, bits), _deq(p1, s1, b1, gs, bits)
+    e0 = [oqt.output_error(w[e], d0[e], hs[e]) for e in range(4)]
+    e1 = [oqt.output_error(w[e], d1[e], hs[e]) for e in range(4)]
+    for a, b in zip(e0, e1):
+        assert b <= a * (1 + 1e-5)
+    assert sum(e1) < sum(e0)                      # some improvement overall
+    # Within one variant, refinement only moves codes: scales are unchanged.
+    _, sa, _ = oqt.gptq_quantize(w, hs, bits, gs, group_params="static", refine_sweeps=0)
+    _, sb, _ = oqt.gptq_quantize(w, hs, bits, gs, group_params="static", refine_sweeps=2)
+    np.testing.assert_array_equal(np.array(sa.astype(mx.float32)), np.array(sb.astype(mx.float32)))
+
+
+def test_refinement_matches_bruteforce_loss_change():
+    """Each accepted move must lower the exact quadratic loss: check the final
+    loss against a direct recomputation."""
+    gs, bits = 32, 3
+    w = (mx.random.normal((1, 8, 64), key=mx.random.key(41)) * 0.05).astype(mx.float32)
+    h = _hessian(_correlated_inputs(128, 64, seed=60))[None]
+    p, s, b = oqt.gptq_quantize(w.astype(mx.bfloat16), h, bits, gs, refine_sweeps=0)
+    q0 = _deq(p, s, b, gs, bits)
+    # Recover integer codes from the dequantized values.
+    S = mx.repeat(s.astype(mx.float32), gs, axis=-1); B_ = mx.repeat(b.astype(mx.float32), gs, axis=-1)
+    c = mx.round((q0 - B_) / S).astype(mx.uint8)
+    W = w.astype(mx.bfloat16).astype(mx.float32)
+    c2, n = oqt.refine_codes(W, h, c, s.astype(mx.float32), b.astype(mx.float32), bits, gs, sweeps=3)
+    q2 = c2.astype(mx.float32) * S + B_
+    loss = lambda q: float(mx.sum(((q - W) @ h) * (q - W)).item())
+    assert loss(q2) <= loss(q0) + 1e-9

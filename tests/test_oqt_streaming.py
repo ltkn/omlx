@@ -159,3 +159,105 @@ def test_exact_script_flags_with_mtp_and_ngram8(checkpoint, tmp_path):
     oq.quantize_oq_streaming(str(source), str(tmp_path / "out2"), 4, **kwargs)
     report2 = json.loads((tmp_path / "out2" / "oqt_report.json").read_text())
     assert all(layer.get("reused") for layer in report2["layers"].values())
+
+
+def _flat_config_quant(out):
+    cfg = json.loads((out / "config.json").read_text())
+    return cfg.get("quantization") or cfg.get("quantization_config") or {}
+
+
+def test_routing_protection_upgrades_and_writer_accepts(checkpoint, tmp_path):
+    """M4: with a zero threshold every MoE block exceeds it, so pre-router
+    tensors get more bits; the writer must write those bits and record them."""
+    from mlx_vlm.utils import load_model
+    from omlx.patches.mlx_vlm_qwen4_exp_compat import configure_qwen4_exp_runtime
+
+    source, tokens = checkpoint
+    out = tmp_path / "out"
+    _build(source, out, tmp_path / "cache", oqt_options={
+        "routing_mass_threshold": 0.0, "routing_max_layers_frac": 1.0, "routing_max_extra_bits": 1})
+    report = json.loads((out / "oqt_report.json").read_text())
+    assert report["declined_by_writer"] == []
+    routed = {k: v for k, v in report["layers"].items() if v.get("routing")}
+    assert routed, "no MoE block reported routing stats"
+    upgraded = {t: fb for v in routed.values() for t, fb in (v["routing"].get("upgraded") or {}).items()}
+    q = _flat_config_quant(out)
+    if upgraded:
+        # Every upgraded tensor is written at its new width and recorded per layer.
+        for rel, (frm, to) in upgraded.items():
+            full = next(k for k in report["tensors"] if k.endswith(rel))
+            assert report["tensors"][full]["bits"] == to and to > frm
+            assert q[full]["bits"] == to, (full, q.get(full))
+    assert "routing_mass_shift_median" in report["summary"]
+    # M5 measurement is present for MoE blocks.
+    assert any(v.get("expert_usage") for v in report["layers"].values())
+    assert report["summary"]["expert_tiering_signal"] in {"strong", "moderate", "weak"}
+    configure_qwen4_exp_runtime(out, mode="resident", mtp_enabled=False)
+    loaded = load_model(out, lazy=True, strict=True)
+    assert mx.isfinite(loaded(tokens).logits).all().item()
+
+
+def test_writer_resume_produces_identical_output(checkpoint, tmp_path, monkeypatch):
+    import omlx.oq as oq
+    import omlx.oqt as oqt
+
+    source, _ = checkpoint
+    monkeypatch.setattr(oq, "_MAX_SHARD_BYTES", 2048)          # many small shards
+    cache = tmp_path / "cache"
+    ref = tmp_path / "ref"
+    _build(source, ref, cache, resume_writer=True)
+    assert not (ref / oqt.WriterJournal.NAME).exists()          # journal removed on success
+
+    # Interrupted run: crash after the second shard is journaled.
+    crashed = tmp_path / "crashed"
+    real_record = oqt.WriterJournal.record
+    calls = {"n": 0}
+
+    def record_then_crash(self, *a, **kw):
+        real_record(self, *a, **kw)
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise KeyboardInterrupt("simulated crash")
+
+    monkeypatch.setattr(oqt.WriterJournal, "record", record_then_crash)
+    with pytest.raises(KeyboardInterrupt):
+        _build(source, crashed, cache, resume_writer=True)
+    assert (crashed / oqt.WriterJournal.NAME).exists()
+    monkeypatch.setattr(oqt.WriterJournal, "record", real_record)
+
+    skipped = {"n": 0}
+    real_restore = oqt.WriterJournal.restore
+
+    def counting_restore(self):
+        r = real_restore(self)
+        skipped["n"] = r[0]
+        return r
+
+    monkeypatch.setattr(oqt.WriterJournal, "restore", counting_restore)
+    _build(source, crashed, cache, resume_writer=True)           # resume
+    assert skipped["n"] > 0, "resume did not skip any tensors"
+    a, b = _load_all(ref), _load_all(crashed)
+    assert a.keys() == b.keys()
+    for k in a:
+        np.testing.assert_array_equal(np.array(a[k].astype(mx.float32) if a[k].dtype == mx.bfloat16 else a[k]),
+                                      np.array(b[k].astype(mx.float32) if b[k].dtype == mx.bfloat16 else b[k]), err_msg=k)
+    assert _flat_config_quant(ref) == _flat_config_quant(crashed)
+    assert json.loads((ref / "model.safetensors.index.json").read_text())["weight_map"] == \
+        json.loads((crashed / "model.safetensors.index.json").read_text())["weight_map"]
+
+
+def test_writer_resume_starts_over_when_inputs_change(checkpoint, tmp_path, monkeypatch):
+    import omlx.oq as oq
+    import omlx.oqt as oqt
+
+    source, _ = checkpoint
+    monkeypatch.setattr(oq, "_MAX_SHARD_BYTES", 2048)
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "model-00001-of-PLACEHOLDER.safetensors").write_bytes(b"stale")
+    (out / oqt.WriterJournal.NAME).write_text(json.dumps({
+        "digest": "something-else", "tensors_done": 5, "shards": 1,
+        "weight_map": {"x": "model-00001-of-PLACEHOLDER.safetensors"}, "per_layer_config": {}}))
+    _build(source, out, tmp_path / "cache", resume_writer=True)
+    assert not (out / oqt.WriterJournal.NAME).exists()
+    assert not (out / "model-00001-of-PLACEHOLDER.safetensors").exists()

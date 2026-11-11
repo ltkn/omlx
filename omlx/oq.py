@@ -7002,6 +7002,7 @@ def quantize_oq_streaming(
     teacher_matched: bool = False,
     oqt_cache_path: str = "",
     oqt_options: dict | None = None,
+    resume_writer: bool = False,
 ) -> None:
     """Tensor-by-tensor quantization. Memory: ~3-4GB regardless of model size.
 
@@ -7105,7 +7106,14 @@ def quantize_oq_streaming(
         oqt_cache_path: Directory for the per-layer oQ-T cache (resumable).
             Default: ``<output>.oqt-cache`` next to the output.
         oqt_options: Extra keyword arguments for oqt.run_streaming_sweep
-            (prior_tokens, damp, group_params, expert_chunk, compare_oqe).
+            (prior_tokens, damp, group_params, expert_chunk, compare_oqe,
+            refine_sweeps, refine_expert_sweeps, routing_protect,
+            routing_mass_threshold, routing_max_extra_bits,
+            routing_max_layers_frac).
+        resume_writer: Keep a progress journal in the output directory and,
+            when a previous run with identical inputs was interrupted, skip
+            the tensors already written to its shards (see oqt.WriterJournal).
+            Not used for layouts whose writer keeps cross-tensor state.
     """
     if oq_level not in OQ_LEVELS:
         raise ValueError(
@@ -7124,7 +7132,12 @@ def quantize_oq_streaming(
     source = Path(model_path)
     output = Path(output_path)
     if output.exists():
-        raise ValueError(f"Output directory already exists: {output_path}")
+        # The only accepted existing output is an interrupted build that left
+        # a writer journal behind, and only when resuming was asked for.
+        from .oqt import WriterJournal as _WJ
+
+        if not (resume_writer and (output / _WJ.NAME).exists()):
+            raise ValueError(f"Output directory already exists: {output_path}")
 
     _progress_last_log = {"time": 0.0, "pct": -100.0, "detail": ""}
 
@@ -7783,7 +7796,31 @@ def quantize_oq_streaming(
             centered_norms=not muse_spark_layout.is_upstream_layout(all_weights.keys()),
         )
 
+    writer_journal = None
+    resume_skip = 0
+    if resume_writer and upstream_writer is None and not folded_scales:
+        from . import oqt as _oqt_journal
+
+        writer_journal = _oqt_journal.WriterJournal(output, _oqt_journal.writer_digest(
+            model_path=str(model_path), oq_level=oq_level, group_size=group_size, dtype=dtype,
+            text_only=text_only, preserve_mtp=preserve_mtp,
+            preserve_ngram_table=preserve_ngram_table, ngram_bits=ngram_bits,
+            enhanced=enhanced, boost_map=config.get("_oq_boost_map"),
+            tensor_names=tensor_names, imatrix_cache_path=imatrix_cache_path,
+            oqt=oqt_results))
+        resume_skip, out_shard_idx, weight_map, per_layer_config, _extra = writer_journal.restore()
+        if resume_skip and oqt_results is not None:
+            oqt_results.used.extend(_extra.get("oqt_used", []))
+        if resume_skip and imatrix_report is not None:
+            for _k, _v in (_extra.get("imatrix_report") or {}).items():
+                if isinstance(imatrix_report.get(_k), list):
+                    imatrix_report[_k].extend(_v)
+    _tensor_counter = 0
+
     for tensor_name in tensor_names:
+        _tensor_counter += 1
+        if _tensor_counter <= resume_skip:
+            continue
         if tensor_name in folded_scales:
             # Held for its weight below, which may also come first and take it.
             if tensor_name not in consumed_scales:
@@ -7886,7 +7923,9 @@ def quantize_oq_streaming(
                     if oqt_results is not None and qmode == "affine":
                         oqt_hit = oqt_results.lookup(tensor_name, bits, gs, tuple(shape))
                     if oqt_hit is not None:
-                        qw, scales, biases = oqt_hit
+                        # The 4th value is the cached bit width: equal to the plan,
+                        # or raised by oQ-T routing protection (recorded below).
+                        qw, scales, biases, bits = oqt_hit
                     else:
                         importance = None
                         if imatrix_data is not None and qmode == "affine":
@@ -7945,6 +7984,12 @@ def quantize_oq_streaming(
                 weight_map[k] = shard_name
             out_shard_idx += 1
             out_shard_data = {}
+            if writer_journal is not None:
+                writer_journal.record(
+                    _tensor_counter, out_shard_idx, weight_map, per_layer_config,
+                    extra={"oqt_used": list(oqt_results.used) if oqt_results else [],
+                           "imatrix_report": {k_: v_ for k_, v_ in (imatrix_report or {}).items()
+                                              if isinstance(v_, list)}})
             mx.synchronize()
             mx.clear_cache()
             logger.info(f"oQ{oq_level:g}: wrote output shard {out_shard_idx}")
@@ -8121,6 +8166,8 @@ def quantize_oq_streaming(
     if oqt_results is not None:
         with open(output / "oqt_report.json", "w") as f:
             json.dump(oqt_results.report(), f, indent=2, ensure_ascii=False)
+    if writer_journal is not None:
+        writer_journal.finish()
 
     _copy_model_sidecars(
         source, output, text_only=text_only, model_type=config.get("model_type", "")
