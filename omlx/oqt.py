@@ -1422,3 +1422,254 @@ def writer_digest(**parts) -> str:
             v = [str(v), st.st_size, int(st.st_mtime)]
         norm[k] = v
     return hashlib.sha256(json.dumps(norm, sort_keys=True, default=str).encode()).hexdigest()
+
+
+# ===========================================================================
+# M3 — scoring quants against the original model
+# ===========================================================================
+#
+# record_reference streams the BF16 source one block at a time over fixed
+# evaluation windows and stores, per token, the original model's top-k next
+# token log-probabilities plus the remaining mass, and per MoE layer the
+# router's chosen experts and weights. score_against_reference runs a loaded
+# quant over the same windows and reports KL divergence, top-1 agreement and
+# routing flips, per slice and per layer.
+
+REFERENCE_VERSION = "oqt-ref-v1"
+
+
+def _streamed_head(source: Path, config: dict):
+    """The model's final head as a callable hidden -> logits, from source tensors."""
+    oq = _oq()
+    import mlx.nn as nn
+
+    plan = oq._streamed_source_plan(source, config)
+    text_config = config.get("text_config") or config
+    model_type = oq._stream_source_model_type(config)
+    if model_type == "qwen4_exp":
+        from mlx_vlm.models.qwen4_exp.config import TextConfig
+        from mlx_vlm.models.qwen4_exp.language import Qwen4ExpGatedResidual
+
+        prefix = "language_model.model.hyper_connection_mixer."
+        mixer = Qwen4ExpGatedResidual(TextConfig.from_dict(text_config), use_combine=False)
+        mixer.load_weights([(k[len(prefix):], plan.pop(k)) for k in list(plan) if k.startswith(prefix)],
+                           strict=True)
+        mixer.eval()
+        pre = mixer
+    else:
+        norm_w = plan.pop("language_model.model.norm.weight")
+        pre = nn.RMSNorm(int(norm_w.shape[0]), eps=float(text_config.get("rms_norm_eps") or 1e-6))
+        pre.weight = norm_w
+    head_key = "language_model.lm_head.weight"
+    head_w = plan.pop(head_key) if head_key in plan else plan.pop(oq._STREAM_EMBED_KEY)
+    head_w = head_w[:] if hasattr(head_w, "__getitem__") and not isinstance(head_w, mx.array) else head_w
+    mx.eval(head_w)
+
+    def head(hidden):
+        return pre(hidden) @ head_w.T
+
+    return head
+
+
+def _topk_logprobs(logits: mx.array, k: int):
+    """Top-k log-probabilities and the log of the remaining probability mass."""
+    logp = logits.astype(mx.float32) - mx.logsumexp(logits.astype(mx.float32), axis=-1, keepdims=True)
+    idx = mx.argpartition(-logp, kth=k - 1, axis=-1)[..., :k]
+    top = mx.take_along_axis(logp, idx, axis=-1)
+    order = mx.argsort(-top, axis=-1)
+    idx = mx.take_along_axis(idx, order, axis=-1)
+    top = mx.take_along_axis(top, order, axis=-1)
+    rest = mx.log(mx.maximum(1.0 - mx.exp(top).sum(axis=-1), 1e-12))
+    return idx, top, rest
+
+
+def record_reference(model_path: str, config: dict, windows: mx.array, out_path: str, *,
+                     slices: list[str] | None = None, top_k: int = 64,
+                     trust_remote_code: bool = False, token_chunk: int = 256,
+                     progress: Callable | None = None) -> dict:
+    """Stream the source model over ``windows`` [N, L] and save the reference."""
+    oq = _oq()
+    model_type = oq._stream_source_model_type(config)
+    if model_type == "deepseek_v41":
+        raise NotImplementedError("M3 reference does not support DeepSeek V4.1 yet")
+    if model_type not in ("qwen4_exp",) and not oq._stream_calibration_supported(model_type):
+        raise ValueError(f"M3 needs a streamable layout; {model_type!r} is not one")
+    source = Path(model_path)
+    if model_type == "qwen4_exp":
+        oq._qwen4_exp_apply_compat_patch()
+    text_config = config.get("text_config") or {}
+    router_k = int(text_config.get("num_experts_per_tok") or config.get("num_experts_per_tok") or 0)
+
+    embed_weight = oq._streamed_embed_weight(source, config)
+    embedded = oq._streamed_embed(embed_weight, windows, config)
+    mx.eval(embedded)
+    del embed_weight
+    n = int(windows.shape[0])
+    if model_type == "qwen4_exp":
+        embedded, layer_masks, pos = oq._streamed_qwen4_exp_state(config, windows, embedded)
+        mx.eval(embedded)
+        states = [oq._streamed_qwen4_exp_slot_state(windows, pos, i, i + 1) for i in range(n)]
+        masks = layer_masks
+    else:
+        _, lm, pos = oq._prepare_layer_inputs(oq._StreamingNoModel(), [None], windows[:1], embedded[:1],
+                                              noncausal=oq._noncausal_attention(config))
+        states, masks = [pos] * n, None
+    working = [embedded[i:i + 1] for i in range(n)]
+    del embedded
+
+    route_idx, route_p, moe_layers = [], [], []
+    for layer_idx, block, _ in oq._iter_streamed_layer_blocks(source, config,
+                                                               trust_remote_code=trust_remote_code):
+        router = _find_router(block) if router_k else None
+        tap = _RouterTap(router_k) if router is not None else None
+        if tap is not None:
+            tap.attach(router)
+            tap.record_as = "teacher"
+        try:
+            for s in range(n):
+                if tap is not None:
+                    tap.slot = s
+                m = masks[layer_idx] if masks is not None else lm[0]
+                out, _ = oq._forward_layer_result(block, working[s], m, states[s], layer_idx=layer_idx)
+                mx.eval(out)
+                working[s] = out
+        finally:
+            if tap is not None:
+                tap.detach()
+        if tap is not None and tap.teacher:
+            moe_layers.append(layer_idx)
+            route_idx.append(np.stack([np.array(tap.teacher[s][0]).astype(np.int16) for s in range(n)]))
+            route_p.append(np.stack([np.array(tap.teacher[s][1]).astype(np.float16) for s in range(n)]))
+        del block
+        mx.clear_cache()
+        if progress:
+            progress(layer_idx)
+
+    head = _streamed_head(source, config)
+    ids_all, top_all, rest_all = [], [], []
+    for s in range(n):
+        h = working[s][0]
+        ids_w, top_w, rest_w = [], [], []
+        for t0 in range(0, h.shape[0], token_chunk):
+            i_, t_, r_ = _topk_logprobs(head(h[None, t0:t0 + token_chunk])[0], top_k)
+            mx.eval(i_, t_, r_)
+            ids_w.append(np.array(i_).astype(np.int32))
+            top_w.append(np.array(t_).astype(np.float16))
+            rest_w.append(np.array(r_).astype(np.float32))
+        ids_all.append(np.concatenate(ids_w))
+        top_all.append(np.concatenate(top_w))
+        rest_all.append(np.concatenate(rest_w))
+        mx.clear_cache()
+    meta = {"version": REFERENCE_VERSION, "source": str(source.resolve()), "top_k": top_k,
+            "router_k": router_k, "windows": n, "seq_len": int(windows.shape[1]),
+            "slices": slices or ["all"] * n, "moe_layers": moe_layers}
+    arrays = {"windows": np.array(windows).astype(np.int32), "top_ids": np.stack(ids_all),
+              "top_logp": np.stack(top_all), "rest_logp": np.stack(rest_all)}
+    if moe_layers:
+        arrays["route_idx"] = np.stack(route_idx)       # [layers, N, L, k]
+        arrays["route_p"] = np.stack(route_p)
+    tmp = Path(out_path).with_suffix(".tmp.npz")
+    np.savez(tmp, meta=np.array(json.dumps(meta)), **arrays)
+    tmp.replace(out_path)
+    return meta
+
+
+def _model_layers(model):
+    for path in ("language_model.model.layers", "model.layers", "layers"):
+        obj = model
+        try:
+            for part in path.split("."):
+                obj = getattr(obj, part)
+            return list(obj)
+        except AttributeError:
+            continue
+    raise ValueError("cannot find the decoder layers of the loaded model")
+
+
+def _forward_window_logits(model, ids: mx.array) -> mx.array:
+    arr = ids[None]
+    for call in (lambda: model.language_model(arr), lambda: model(arr)):
+        try:
+            out = call()
+            break
+        except (TypeError, AttributeError):
+            continue
+    else:
+        raise RuntimeError("could not run a forward pass on the loaded model")
+    logits = getattr(out, "logits", out)
+    return logits[0]
+
+
+def score_against_reference(model, reference_path: str, *, token_chunk: int = 512) -> dict:
+    """KL, top-1 agreement and routing flips of a loaded model vs the reference."""
+    data = np.load(reference_path, allow_pickle=False)
+    meta = json.loads(str(data["meta"]))
+    windows = data["windows"]
+    n = windows.shape[0]
+    layers = _model_layers(model)
+    moe_layers = meta["moe_layers"]
+    taps = {}
+    for li in moe_layers:
+        r = _find_router(layers[li])
+        if r is not None:
+            tap = _RouterTap(meta["router_k"])
+            tap.attach(r)
+            tap.record_as = "student"
+            taps[li] = tap
+    per_slice: dict[str, dict] = {}
+    layer_shift = {li: [0.0, 0.0, 0] for li in taps}          # mass, flips, tokens
+    try:
+        for s in range(n):
+            for tap in taps.values():
+                tap.slot = s
+            logits = _forward_window_logits(model, mx.array(windows[s]))
+            mx.eval(logits)
+            ids = mx.array(data["top_ids"][s])
+            tlogp = mx.array(data["top_logp"][s].astype(np.float32))
+            trest = mx.array(data["rest_logp"][s])
+            kl_sum = agree = tokens = 0.0
+            for t0 in range(0, logits.shape[0], token_chunk):
+                lg = logits[t0:t0 + token_chunk].astype(mx.float32)
+                logq = lg - mx.logsumexp(lg, axis=-1, keepdims=True)
+                i_, tp, tr = ids[t0:t0 + token_chunk], tlogp[t0:t0 + token_chunk], trest[t0:t0 + token_chunk]
+                q_top = mx.take_along_axis(logq, i_, axis=-1)
+                q_rest = mx.log(mx.maximum(1.0 - mx.exp(q_top).sum(axis=-1), 1e-12))
+                p = mx.exp(tp)
+                kl = (p * (tp - q_top)).sum(axis=-1) + mx.exp(tr) * (tr - q_rest)
+                kl_sum += float(mx.sum(mx.maximum(kl, 0.0)).item())
+                agree += float(mx.sum(mx.argmax(logq, axis=-1) == i_[:, 0]).item())
+                tokens += lg.shape[0]
+            sl = meta["slices"][s]
+            acc = per_slice.setdefault(sl, {"kl_sum": 0.0, "agree": 0.0, "tokens": 0.0})
+            acc["kl_sum"] += kl_sum
+            acc["agree"] += agree
+            acc["tokens"] += tokens
+            for j, li in enumerate(moe_layers):
+                tap = taps.get(li)
+                if tap is None or s not in tap.student:
+                    continue
+                t_idx = mx.array(data["route_idx"][j, s].astype(np.int32))
+                t_p = mx.array(data["route_p"][j, s].astype(np.float32))
+                s_idx = tap.student[s]
+                kept = mx.any(t_idx[:, :, None] == s_idx[:, None, :], axis=-1)
+                layer_shift[li][0] += float(mx.sum(mx.sum(t_p * (1.0 - kept.astype(mx.float32)), axis=-1)).item())
+                layer_shift[li][1] += float(mx.sum(mx.any(~kept, axis=-1).astype(mx.float32)).item())
+                layer_shift[li][2] += int(t_idx.shape[0])
+            for tap in taps.values():
+                tap.reset_student()
+            mx.clear_cache()
+    finally:
+        for tap in taps.values():
+            tap.detach()
+    slices = {k: {"kl": v["kl_sum"] / max(v["tokens"], 1), "top1": v["agree"] / max(v["tokens"], 1),
+                  "tokens": int(v["tokens"])} for k, v in sorted(per_slice.items())}
+    total_tokens = sum(v["tokens"] for v in per_slice.values())
+    overall = {"kl": sum(v["kl_sum"] for v in per_slice.values()) / max(total_tokens, 1),
+               "top1": sum(v["agree"] for v in per_slice.values()) / max(total_tokens, 1),
+               "tokens": int(total_tokens)}
+    routing = {str(li): {"mass_shift": m / max(t, 1), "flip_rate": f / max(t, 1)}
+               for li, (m, f, t) in layer_shift.items() if t}
+    if routing:
+        overall["routing_mass_shift"] = float(np.mean([v["mass_shift"] for v in routing.values()]))
+        overall["routing_flip_rate"] = float(np.mean([v["flip_rate"] for v in routing.values()]))
+    return {"reference": meta, "overall": overall, "slices": slices, "routing_by_layer": routing}

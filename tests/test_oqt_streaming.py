@@ -301,3 +301,43 @@ def test_long_windows_pack_whole_documents_and_build(checkpoint, tmp_path, monke
         "long_calib_path": str(docs), "long_seq_length": 8, "long_share": 0.5})
     rep2 = json.loads((out2 / "oqt_report.json").read_text())
     assert not any(l.get("reused") for l in rep2["layers"].values())
+
+
+def test_m3_reference_matches_full_model_and_scores_quants(checkpoint, tmp_path):
+    from mlx_vlm.utils import load_model
+    from omlx.patches.mlx_vlm_qwen4_exp_compat import configure_qwen4_exp_runtime
+    from omlx import oqt
+
+    source, tokens = checkpoint
+    config = json.loads((source / "config.json").read_text())
+    ref = tmp_path / "ref.npz"
+    meta = oqt.record_reference(str(source), config, tokens, str(ref), slices=["se", "se", "gen", "gen"],
+                                top_k=8)
+    data = np.load(ref)
+    assert data["top_ids"].shape == (4, 8, 8) and meta["moe_layers"]
+
+    # 1. The streamed reference equals the whole float model's output.
+    configure_qwen4_exp_runtime(source, mode="resident", mtp_enabled=False)
+    full = load_model(source, lazy=True, strict=True)
+    for s in range(4):
+        logits = oqt._forward_window_logits(full, mx.array(data["windows"][s])).astype(mx.float32)
+        logp = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        np.testing.assert_array_equal(np.array(mx.argmax(logp, axis=-1)), data["top_ids"][s][:, 0])
+        np.testing.assert_allclose(
+            np.array(mx.take_along_axis(logp, mx.array(data["top_ids"][s]), axis=-1)),
+            data["top_logp"][s].astype(np.float32), atol=2e-2)
+
+    # 2. The original model scored against itself: no divergence, no flips.
+    own = oqt.score_against_reference(full, str(ref))
+    assert own["overall"]["kl"] < 1e-3 and own["overall"]["top1"] == 1.0
+    assert own["routing_by_layer"] and own["overall"]["routing_flip_rate"] == 0.0
+    assert set(own["slices"]) == {"se", "gen"}
+
+    # 3. A quant diverges a little and every MoE layer is measured.
+    out = tmp_path / "quant"
+    _build(source, out, tmp_path / "cache")
+    configure_qwen4_exp_runtime(out, mode="resident", mtp_enabled=False)
+    quant = load_model(out, lazy=True, strict=True)
+    sc = oqt.score_against_reference(quant, str(ref))
+    assert sc["overall"]["kl"] > 0 and 0 < sc["overall"]["top1"] <= 1
+    assert set(sc["routing_by_layer"]) == {str(l) for l in meta["moe_layers"]}
