@@ -116,6 +116,7 @@ enum SettingsSearch {
         add(.appearance, ["appearance.section.general"], [
             ("appearance.row.refresh_interval", "menu bar update frequency polling"),
             ("appearance.row.show_dock_icon", "application icon"),
+            ("appearance.row.number_scale", "exact digits compact units count"),
         ])
         add(.appearance, ["appearance.section.model_library"], [("appearance.row.visible_models", "favorites menu bar")])
         add(.appearance, ["appearance.section.menubar_items"], [
@@ -188,6 +189,16 @@ enum SettingsSearch {
             ("integrations.splash.max_memory", "RAM GB cap"),
             ("integrations.splash.ssd_cache", "disk storage size"),
             ("integrations.splash.ane_prefill", "ANE prompt processing"),
+        ])
+        add(.integrations, ["integrations.websearch.section_label"], [
+            ("integrations.websearch.provider", "internet DDGS DuckDuckGo Brave SearXNG"),
+            ("integrations.websearch.ddgs_backends", "DDGS custom engines grokipedia mojeek wikipedia yahoo yandex"),
+            ("integrations.websearch.brave_api_key", "Brave credential token"),
+            ("integrations.websearch.searxng_url", "SearXNG instance endpoint"),
+            ("integrations.websearch.max_results", "sources count"),
+            ("integrations.websearch.content_mode", "snippets full page"),
+            ("integrations.websearch.content_truncate", "truncate page context"),
+            ("integrations.websearch.content_max_chars", "characters limit"),
         ])
         add(.integrations, ["integrations.section.claude_code"], [
             ("integrations.claude.mode", "local cloud Anthropic"),
