@@ -1152,6 +1152,189 @@ def _routed_expert_projection(path: str) -> str | None:
     return None
 
 
+# Damage-based routed-expert widths (oQ-T builds): each layer's experts get one
+# width from base-1..base+1, never below this floor, chosen from the measured
+# output damage at each width so the total damage is lowest at the same bytes.
+_EXPERT_ALLOC_MIN_BITS = 4
+
+
+def _expert_alloc_widths(oq_level) -> tuple[int, ...]:
+    """Widths a layer's routed experts may take; fewer than two means no allocation."""
+    base = _base_bits_for_level(oq_level)
+    return tuple(
+        b for b in (base - 1, base, base + 1)
+        if b in _VALID_QUANT_BITS and b >= _EXPERT_ALLOC_MIN_BITS
+    )
+
+
+def _qdq_routed_experts(block, bits: int, group_size: int = _OQ_DEFAULT_GROUP_SIZE) -> dict:
+    """Quantize-dequantize only the block's routed experts at ``bits``; returns the saved weights."""
+    gs = _gs_for_mode(bits, group_size)
+    mode = _mode_for_bits(bits)
+    saved = {}
+    for path, module in tree_flatten(block.leaf_modules(), is_leaf=nn.Module.is_module):
+        if not hasattr(module, "weight") or not hasattr(module, "to_quantized"):
+            continue
+        if getattr(module.weight, "ndim", 0) < 2:
+            continue
+        if inkling2_layout.is_expert_carrier(module):
+            continue
+        if not _is_routed_expert(_normalize_quant_path(path)) or module.weight.shape[-1] % gs:
+            continue
+        saved[path] = module.weight
+        module.weight = _qdq_weight_only(module.weight, bits, gs, mode)
+    return saved
+
+
+def _allocate_expert_widths(
+    named_shapes: dict[str, tuple],
+    boost_map: dict[str, dict],
+    damage: dict[int, dict[int, float]],
+    base_bits: int,
+    widths: tuple[int, ...],
+    fixed_overrides: dict[str, dict] | None = None,
+    group_size: int = _OQ_DEFAULT_GROUP_SIZE,
+) -> tuple[dict[str, dict], dict]:
+    """Per-layer routed-expert widths that minimize the summed measured damage
+    without spending more expert bytes than the plan's uniform base width.
+
+    ``damage[layer][bits]`` is the layer's relative output MSE with only its
+    routed experts quantized at ``bits``. Damage is made non-increasing in bits
+    (measurement noise), the choice is a Lagrangian relaxation of the knapsack
+    followed by a greedy top-up of the leftover bytes, and the plan is returned
+    unchanged unless the total damage goes down. Layers without a full
+    measurement, or whose experts the plan already moved off the base width,
+    keep their plan.
+    """
+    from collections import defaultdict
+
+    fixed_overrides = fixed_overrides or {}
+    by_layer: dict[int, list[tuple[str, tuple]]] = defaultdict(list)
+    for path, shape in named_shapes.items():
+        if path in fixed_overrides or _is_mtp_tensor(path) or not _is_routed_expert(path):
+            continue
+        layer_idx = _extract_layer_index(path)
+        if layer_idx >= 0:
+            by_layer[layer_idx].append((path, shape))
+
+    def cost(items, bits):
+        gs = _gs_for_mode(bits, group_size)
+        return sum(_tensor_quantized_bytes(s, bits, gs, _mode_for_bits(bits)) for _, s in items)
+
+    options: dict[int, list[tuple[int, int, float]]] = {}
+    for layer_idx, items in by_layer.items():
+        measured = damage.get(layer_idx) or {}
+        if any(b not in measured for b in widths):
+            continue
+        if any(int((boost_map.get(p) or {}).get("bits", base_bits)) != base_bits for p, _ in items):
+            continue
+        opts, best = [], float("inf")
+        for b in sorted(widths):
+            best = min(best, float(measured[b]))
+            opts.append((b, cost(items, b), best))
+        # A width that does not cost more bytes cannot be traded (unquantizable shapes).
+        if any(opts[i + 1][1] <= opts[i][1] for i in range(len(opts) - 1)):
+            continue
+        options[layer_idx] = opts
+    report = {"layers": {}, "measured_layers": len(options)}
+    if len(options) < 2 or base_bits not in widths:
+        return boost_map, report
+
+    def at(layer_idx, bits):
+        return next(o for o in options[layer_idx] if o[0] == bits)
+
+    budget = sum(at(li, base_bits)[1] for li in options)
+    damage_before = sum(at(li, base_bits)[2] for li in options)
+
+    def pick(lam):
+        return {li: min(opts, key=lambda o: (o[2] + lam * o[1], o[1])) for li, opts in options.items()}
+
+    def spend(choice):
+        return sum(o[1] for o in choice.values())
+
+    lo, hi = -40.0, 0.0   # log10 of the byte price; at 10**0 every layer takes its cheapest width
+    for _ in range(80):
+        mid = (lo + hi) / 2
+        if spend(pick(10.0 ** mid)) <= budget:
+            hi = mid
+        else:
+            lo = mid
+    choice = pick(10.0 ** hi)
+    # Spend what the relaxation left on the best damage reduction per byte.
+    while True:
+        left = budget - spend(choice)
+        best_step = None
+        for li, cur in choice.items():
+            for o in options[li]:
+                extra = o[1] - cur[1]
+                gain = cur[2] - o[2]
+                if o[0] > cur[0] and 0 < extra <= left and gain > 0:
+                    ratio = gain / extra
+                    if best_step is None or ratio > best_step[0]:
+                        best_step = (ratio, li, o)
+        if best_step is None:
+            break
+        choice[best_step[1]] = best_step[2]
+    damage_after = sum(o[2] for o in choice.values())
+    report.update(
+        damage_before=damage_before,
+        damage_after=damage_after,
+        bytes_before=budget,
+        bytes_after=spend(choice),
+    )
+    if damage_after >= damage_before:
+        return boost_map, report
+
+    new_map = dict(boost_map)
+    for layer_idx, (bits, _, _) in choice.items():
+        report["layers"][layer_idx] = bits
+        for path, _ in by_layer[layer_idx]:
+            if bits == base_bits:
+                new_map.pop(path, None)
+            else:
+                new_map[path] = {
+                    "bits": bits,
+                    "group_size": _gs_for_mode(bits, group_size),
+                    "mode": _mode_for_bits(bits),
+                }
+    return new_map, report
+
+
+def _apply_expert_allocation(config, named_shapes, damage, oq_level, widths, fixed_overrides, group_size):
+    """Rewrite config["_oq_boost_map"] with damage-based expert widths, and log the outcome."""
+    if not damage:
+        logger.info(
+            f"oQ{oq_level:g}: expert widths unchanged (no per-layer expert damage was "
+            "measured: sensitivity came from a map, a proxy or a cache)"
+        )
+        return
+    base_bits = _base_bits_for_level(oq_level)
+    new_map, report = _allocate_expert_widths(
+        named_shapes, config.get("_oq_boost_map") or {}, damage, base_bits, widths, fixed_overrides,
+        group_size,
+    )
+    if not report["layers"]:
+        logger.info(
+            f"oQ{oq_level:g}: expert widths unchanged ({report['measured_layers']} layers measured; "
+            "no cheaper-or-equal mix lowers the measured damage)"
+        )
+        return
+    config["_oq_boost_map"] = new_map
+    counts = {}
+    for bits in report["layers"].values():
+        counts[bits] = counts.get(bits, 0) + 1
+    moved = ", ".join(
+        f"L{li}={b}" for li, b in sorted(report["layers"].items()) if b != base_bits
+    )
+    logger.info(
+        f"oQ{oq_level:g}: expert widths by measured damage: "
+        + ", ".join(f"{n} layers at {b}-bit" for b, n in sorted(counts.items()))
+        + f"; damage {report['damage_before']:.4g} -> {report['damage_after']:.4g}, "
+        f"expert bytes {report['bytes_before'] / 1e9:.2f} -> {report['bytes_after'] / 1e9:.2f} GB"
+        + (f"; moved: {moved}" if moved else "")
+    )
+
+
 # Output head and token embeddings, sized by _mandatory_head_bits before any
 # other boost.
 _MANDATORY_BOOST_PATTERNS = ("lm_head", "embeddings", "embed_tokens", "wte")
@@ -7073,6 +7256,7 @@ def quantize_oq_streaming(
     oqt_cache_path: str = "",
     oqt_options: dict | None = None,
     resume_writer: bool = False,
+    expert_allocation: bool | None = None,
 ) -> None:
     """Tensor-by-tensor quantization. Memory: ~3-4GB regardless of model size.
 
@@ -7183,6 +7367,12 @@ def quantize_oq_streaming(
             refine_sweeps, refine_expert_sweeps, routing_protect,
             routing_mass_threshold, routing_max_extra_bits,
             routing_max_layers_frac).
+        expert_allocation: Give each layer's routed experts its own width,
+            chosen by their measured output damage at each candidate width
+            (base-1..base+1, never below 4 bits), so the total damage is
+            lowest at the expert bytes of the uniform plan. Measured during
+            the streamed sensitivity pass; layers it cannot measure keep the
+            plan. Default: on for oQ-T builds (``teacher_matched``).
         resume_writer: Keep a progress journal in the output directory and,
             when a previous run with identical inputs was interrupted, skip
             the tensors already written to its shards (see oqt.WriterJournal).
@@ -7472,6 +7662,13 @@ def quantize_oq_streaming(
     imatrix_report: dict[str, Any] | None = None
     stream_imatrix = False
     streamed_sensitivity_map: dict | None = None
+    expert_damage: dict[int, dict[int, float]] = {}
+    if expert_allocation is None:
+        expert_allocation = bool(teacher_matched)
+    alloc_widths = _expert_alloc_widths(oq_level) if expert_allocation else ()
+    if len(alloc_widths) > 1:
+        config["_oq_expert_damage_widths"] = alloc_widths
+        config["_oq_expert_damage_group_size"] = int(group_size)
     if enhanced:
         if imatrix_num_samples < 1:
             raise ValueError("imatrix_num_samples must be >= 1")
@@ -7554,6 +7751,10 @@ def quantize_oq_streaming(
                 imatrix_data.metadata.get("collection", {}).get("sensitivity_map")
                 or None
             )
+            for layer, d in (
+                imatrix_data.metadata.get("collection", {}).get("expert_damage") or {}
+            ).items():
+                expert_damage[int(layer)] = {int(b): float(v) for b, v in d.items()}
         cb("imatrix", 18.0, "oQe imatrix calibration ready")
         imatrix_report = {
             "enabled": True,
@@ -7621,6 +7822,7 @@ def quantize_oq_streaming(
                 num_samples=_SENS_NUM_SAMPLES,
                 seq_length=_SENS_SEQ_LENGTH,
                 trust_remote_code=trust_remote_code,
+                expert_damage_out=expert_damage,
             )
         elif not _model_requires_proxy and _uses_quantized_source_sensitivity(config):
             # Native FP8/MXFP8 sources load as quantized modules. The raw QDQ
@@ -7844,8 +8046,15 @@ def quantize_oq_streaming(
             f"oQ{oq_level:g}: quant plan -> {plan.effective_bpw:.2f} bpw "
             f"with {len(plan.boost_map)} boosts"
         )
+        if len(alloc_widths) > 1:
+            _apply_expert_allocation(
+                config, named_shapes, expert_damage, oq_level, alloc_widths, fixed_overrides,
+                group_size,
+            )
     else:
         config["_oq_boost_map"] = {}
+    config.pop("_oq_expert_damage_widths", None)
+    config.pop("_oq_expert_damage_group_size", None)
 
     oqt_results = None
     if teacher_matched:
@@ -10793,6 +11002,30 @@ def _streamed_sensitivity_layer(
         state["scores"][layer_idx] = mse_val.item()
     finally:
         _restore_saved_weights(block, saved)
+    widths = config.get("_oq_expert_damage_widths") or ()
+    if len(widths) > 1:
+        # Damage of this layer's routed experts alone at each candidate width,
+        # for the damage-based expert allocation (same metric, same inputs).
+        out_magnitude = mx.maximum((out_float**2).mean(), 1e-10)
+        damage = {}
+        for bits in widths:
+            saved = _qdq_routed_experts(
+                block, bits, int(config.get("_oq_expert_damage_group_size") or _OQ_DEFAULT_GROUP_SIZE)
+            )
+            if not saved:
+                break
+            try:
+                out_bits, _ = _forward_layer_result(
+                    block, state["inputs"], layer_mask, state["position_ids"], layer_idx=layer_idx
+                )
+                err = ((out_float - out_bits) ** 2).mean() / out_magnitude
+                mx.eval(err)
+                damage[int(bits)] = err.item()
+            finally:
+                _restore_saved_weights(block, saved)
+                mx.clear_cache()
+        if len(damage) == len(widths):
+            state.setdefault("expert_damage", {})[layer_idx] = damage
     # Materialize the boundary before the caller releases the block: a lazy
     # output would keep the whole layer's weights alive in its graph.
     mx.eval(out_float)
@@ -11367,6 +11600,11 @@ def _collect_imatrix_streaming(
         scores = sens_state["scores"] if sens_state is not None else {}
         _log_streamed_sensitivity(sensitivity_oq_level, scores)
         metadata["sensitivity_map"] = scores
+        if sens_state is not None and sens_state.get("expert_damage"):
+            metadata["expert_damage"] = {
+                str(layer): {str(b): v for b, v in d.items()}
+                for layer, d in sens_state["expert_damage"].items()
+            }
     return _oq_imatrix_entries(collector.entries, config), metadata
 
 
@@ -11921,6 +12159,7 @@ def _measure_sensitivity_streaming(
     seq_length: int = 256,
     trust_remote_code: bool = False,
     calib_seed: int = _OQE_STREAM_CALIB_SEED,
+    expert_damage_out: dict | None = None,
 ) -> dict[int, float]:
     """Measure per-layer qdq sensitivity with one decoder layer resident.
 
@@ -11971,6 +12210,8 @@ def _measure_sensitivity_streaming(
             )
 
     _log_streamed_sensitivity(oq_level, state["scores"])
+    if expert_damage_out is not None:
+        expert_damage_out.update(state.get("expert_damage") or {})
     return state["scores"]
 
 
