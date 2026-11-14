@@ -1656,7 +1656,10 @@ def _forward_window_logits(model, ids: mx.array) -> mx.array:
 
 def score_against_reference(model, reference_path: str, *, token_chunk: int = 512) -> dict:
     """KL, top-1 agreement and routing flips of a loaded model vs the reference."""
-    data = np.load(reference_path, allow_pickle=False)
+    # Read every array once: indexing an NpzFile re-reads the whole member, and
+    # the loop below takes one window (and one layer's routing) at a time.
+    with np.load(reference_path, allow_pickle=False) as npz:
+        data = {k: npz[k] for k in npz.files}
     meta = json.loads(str(data["meta"]))
     windows = data["windows"]
     n = windows.shape[0]
