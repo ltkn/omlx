@@ -11018,14 +11018,17 @@ def _collect_imatrix_streaming(
     )
     micro_batch_size = int(batch_plan["micro_batch_size"])
 
-    # Stage 0: source the embedding table once and keep it for the run; each
-    # round embeds only its own slice of the draw (embed_rows below). Embedding
-    # the whole adaptive draw up front kept every sample resident for the
-    # whole pass: at 2048 tokens on a hyper-connection model that is ~47 MB
-    # per sample, ~45 GB for a 962-sample draw, past the active-memory
-    # ceiling after layer 0. Per-round embedding is row-wise identical (an
-    # embedding lookup and the hc tile both act per row), so the statistics
-    # do not change; resident memory is one round, whatever the draw size.
+    # Stage 0 sources the embedding table, builds the sensitivity boundary and
+    # the per-family masks, then drops the table. Each round re-sources it and
+    # embeds only its own slice of the draw (embed_rows below), then drops it
+    # again. Embedding the whole adaptive draw up front kept every sample
+    # resident for the whole pass: at 2048 tokens on a hyper-connection model
+    # that is ~47 MB per sample, ~45 GB for a 962-sample draw, past the
+    # active-memory ceiling after layer 0. Per-round embedding is row-wise
+    # identical (an embedding lookup and the hc tile both act per row), so the
+    # statistics do not change; resident memory is one round, whatever the
+    # draw size, and never more than before. The cost is one table read per
+    # round (seconds, against minutes per round).
     calib_data = calib_data[:max_samples]
     is_qwen4_exp = _stream_source_model_type(config) == "qwen4_exp"
     if is_qwen4_exp:
@@ -11056,6 +11059,7 @@ def _collect_imatrix_streaming(
                 "oQe imatrix streaming: sensitivity calibration draw failed, "
                 "the sweep will return an empty sensitivity map"
             )
+    del embed_weight
     mx.clear_cache()
 
     if is_qwen4_exp:
@@ -11091,10 +11095,10 @@ def _collect_imatrix_streaming(
 
     del embedded
 
-    def embed_rows(lo: int, hi: int):
+    def embed_rows(weight, lo: int, hi: int):
         """Layer-0 inputs for draw rows [lo, hi): embedded, then the same
         per-family transform the whole draw used to get at stage 0."""
-        rows = _streamed_embed(embed_weight, calib_data[lo:hi], config)
+        rows = _streamed_embed(weight, calib_data[lo:hi], config)
         if is_qwen4_exp:
             rows, _, _ = _streamed_qwen4_exp_state(config, calib_data[lo:hi], rows)
         elif is_glm5_next:
@@ -11136,7 +11140,10 @@ def _collect_imatrix_streaming(
         round_start = processed_samples
         round_stop = min(round_start + step_samples, max_samples)
         ranges = _stream_round_micro_ranges(round_start, round_stop, micro_batch_size)
-        working = [embed_rows(lo, hi) for lo, hi in ranges]
+        round_weight = _streamed_embed_weight(source, config)
+        working = [embed_rows(round_weight, lo, hi) for lo, hi in ranges]
+        del round_weight
+        mx.clear_cache()
         slot_states = (
             [
                 _streamed_qwen4_exp_slot_state(calib_data, q4_position_ids, lo, hi)
