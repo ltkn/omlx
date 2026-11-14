@@ -1131,7 +1131,8 @@ def run_streaming_sweep(
     upgraded_layers = 0
 
     def forward_all(block, layer_idx, collector=None, tap=None, commit=True):
-        """Forward every slot; commit=False returns the outputs instead of storing them."""
+        """Forward every slot. commit=True stores each output in place of its input;
+        commit=False returns the outputs; commit=None drops them (router tap only)."""
         outs = []
         for slot in range(len(working)):
             sl = slots[slot]
@@ -1153,9 +1154,31 @@ def run_streaming_sweep(
                 collector.end_forward()
             elif commit:
                 working[slot] = out
-            else:
+            elif commit is False:
                 outs.append(out)
         return outs
+
+    spill_dir = Path(cache_dir).expanduser() / ".spill"
+
+    def spill_inputs():
+        """Save the layer inputs to disk so the check pass can overwrite them in place."""
+        spill_dir.mkdir(parents=True, exist_ok=True)
+        for slot, x in enumerate(working):
+            mx.save_safetensors(str(spill_dir / f"slot-{slot:05d}.safetensors"), {"x": x})
+
+    def restore_inputs():
+        for slot in range(len(working)):
+            working[slot] = None
+        mx.clear_cache()
+        for slot in range(len(working)):
+            x = mx.load(str(spill_dir / f"slot-{slot:05d}.safetensors"))["x"]
+            mx.eval(x)
+            working[slot] = x
+
+    def drop_spill():
+        if spill_dir.exists():
+            for p in spill_dir.glob("slot-*.safetensors"):
+                p.unlink()
 
     for layer_idx, block, _is_moe in oq._iter_streamed_layer_blocks(
         source, config, trust_remote_code=trust_remote_code
@@ -1207,6 +1230,17 @@ def run_streaming_sweep(
 
             originals = {rel: getattr(m, "weight", None) for rel, m in modules.items()}
             tensors, info_by_base, skipped = {}, {}, {}
+            # Only the modules feeding the router can be quantized again (routing
+            # protection); every other module's source weight and Hessian are
+            # dropped as soon as it is quantized.
+            router_parent = router[3] if tap is not None else None
+            requant = {rel for rel in modules
+                       if router_parent is not None and not rel.startswith(router_parent)}
+            acc_users: dict[int, int] = {}
+            for rel in modules:
+                a = collector.accumulator(prefix + rel)
+                if a is not None:
+                    acc_users[id(a)] = acc_users.get(id(a), 0) + (1 if rel not in requant else 1_000_000)
 
             def quantize_one(rel, bits):
                 """Quantize one capture module at ``bits``; returns its info or a skip reason."""
@@ -1261,15 +1295,31 @@ def run_streaming_sweep(
                 _, reason = quantize_one(rel, plan[rel][0])
                 if reason:
                     skipped[prefix + rel] = reason
+                if rel in requant:
+                    continue
+                originals[rel] = None
+                a = collector.accumulator(prefix + rel)
+                if a is not None:
+                    acc_users[id(a)] -= 1
+                    if acc_users[id(a)] == 0 and a.batch:
+                        a.expert_sums = [None] * a.batch   # counts stay for the usage stats
+                        a.total = None
+                mx.clear_cache()
 
-            # Check the quantized block; the outputs become the next block's input.
+            # Check the quantized block; its outputs replace the inputs in place.
+            # A routing upgrade needs the inputs again, so they go to disk first.
+            pre_router = [rel for rel in modules if rel in requant and prefix + rel in info_by_base]
+            may_upgrade = (tap is not None and bool(pre_router) and routing_max_extra_bits > 0
+                           and upgraded_layers < max_upgraded_layers)
+            if may_upgrade:
+                spill_inputs()
             routing = {}
             if tap is not None:
                 tap.attach(router)
                 tap.record_as = "student"
                 tap.reset_student()
             try:
-                outs = forward_all(block, layer_idx, commit=False)
+                forward_all(block, layer_idx, commit=True)
             finally:
                 if tap is not None:
                     tap.detach()
@@ -1278,13 +1328,10 @@ def run_streaming_sweep(
                 mass, flip = tap.shift()
                 routing = {"mass_shift": round(mass, 5), "flip_rate": round(flip, 5),
                            "threshold": routing_mass_threshold}
-                router_parent = tap.parent_prefix
-                pre_router = [rel for rel in modules
-                              if not rel.startswith(router_parent) and prefix + rel in info_by_base]
-                if (mass > routing_mass_threshold and pre_router
-                        and upgraded_layers < max_upgraded_layers and routing_max_extra_bits > 0):
+                if may_upgrade and mass > routing_mass_threshold:
+                    restore_inputs()
                     base_bits = {rel: info_by_base[prefix + rel]["bits"] for rel in pre_router}
-                    best = (mass, {rel: base_bits[rel] for rel in pre_router}, outs)
+                    best = (mass, dict(base_bits))
                     for extra in range(1, routing_max_extra_bits + 1):
                         new_bits = {rel: _bits_up(base_bits[rel], extra) for rel in pre_router}
                         for rel in pre_router:
@@ -1292,30 +1339,30 @@ def run_streaming_sweep(
                         tap.attach(router)
                         tap.reset_student()
                         try:
-                            trial = forward_all(block, layer_idx, commit=False)
+                            forward_all(block, layer_idx, commit=None)
                         finally:
                             tap.detach()
                         m2, f2 = tap.shift()
                         if m2 < best[0]:
-                            best = (m2, new_bits, trial)
+                            best = (m2, new_bits)
                         if m2 <= routing_mass_threshold:
                             break
-                    # Re-apply the best configuration (the last trial may not be it).
+                    # Re-apply the best configuration and forward it once more:
+                    # the same weights give the same outputs the trial produced.
                     final_bits = best[1]
                     for rel in pre_router:
                         quantize_one(rel, final_bits[rel])
                         if final_bits[rel] != base_bits[rel]:
                             info_by_base[prefix + rel]["bits_override"] = True
                             info_by_base[prefix + rel]["planned_bits"] = base_bits[rel]
-                    outs = best[2]   # outputs of exactly the re-applied configuration
+                    forward_all(block, layer_idx, commit=True)
                     upgraded = {rel: [base_bits[rel], final_bits[rel]]
                                 for rel in pre_router if final_bits[rel] != base_bits[rel]}
                     if upgraded:
                         upgraded_layers += 1
                     routing.update({"mass_shift_after": round(best[0], 5), "upgraded": upgraded})
-
-            for slot, out in enumerate(outs):
-                working[slot] = out
+            if may_upgrade:
+                drop_spill()
 
             usage = _expert_usage(collector)
             del collector
@@ -1330,12 +1377,19 @@ def run_streaming_sweep(
 
         layers_meta[layer_idx] = meta
         prev_digest = digest
-        del block
+        # Drop every reference to this layer (its modules, original weights,
+        # check outputs, cached tensors, router tap) so clear_cache frees it
+        # before the next layer is sourced; otherwise two layers overlap.
+        block = modules = probe = originals = outs = tensors = None
+        tap = router = quantize_one = None
         mx.synchronize()
         mx.clear_cache()
         done = layer_idx + 1
         msg = (f"oQ-T sweep: layer {done}/{total_layers or '?'} "
-               f"({time.monotonic() - t_start:.0f}s elapsed)")
+               f"({time.monotonic() - t_start:.0f}s elapsed, "
+               f"active {mx.get_active_memory() / 1e9:.1f} GB, "
+               f"peak {mx.get_peak_memory() / 1e9:.1f} GB, "
+               f"cache {mx.get_cache_memory() / 1e9:.1f} GB)")
         r = meta.get("routing") or {}
         if r:
             msg += f", routing shift {r.get('mass_shift', 0):.3f}"
