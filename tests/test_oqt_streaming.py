@@ -341,3 +341,34 @@ def test_m3_reference_matches_full_model_and_scores_quants(checkpoint, tmp_path)
     sc = oqt.score_against_reference(quant, str(ref))
     assert sc["overall"]["kl"] > 0 and 0 < sc["overall"]["top1"] <= 1
     assert set(sc["routing_by_layer"]) == {str(l) for l in meta["moe_layers"]}
+
+
+def test_oqt_with_oqh_is_refused_before_any_work(tmp_path):
+    """oQ-T and oQh both replace the decoder linears at write time, so asking
+    for both must fail up front instead of one silently discarding the other."""
+    import omlx.oq as oq
+
+    with pytest.raises(ValueError, match="cannot be combined with hadamard"):
+        oq.quantize_oq_streaming(str(tmp_path / "missing-source"), str(tmp_path / "out"),
+                                 4, enhanced=True, teacher_matched=True, hadamard=True)
+    assert not (tmp_path / "out").exists()
+
+
+def test_oqt_build_skips_oqe_rounding_refinement(checkpoint, tmp_path, monkeypatch):
+    """The oQe refine step (#5292) would re-round oQ-T's GPTQ tensors; an
+    oQ-T build must skip it while a plain oQe build of the same source runs it."""
+    import omlx.oq as oq
+
+    calls = []
+    monkeypatch.setattr(oq, "_refine_oqe_output",
+                        lambda *a, **kw: calls.append(a[1]) or {"skipped": "spy"})
+    source, _ = checkpoint
+
+    _build(source, tmp_path / "oqt", tmp_path / "oqt-cache")
+    assert calls == []
+
+    oq.quantize_oq_streaming(
+        str(source), str(tmp_path / "oqe"), 4, group_size=32, enhanced=True,
+        stream_calibration=True, imatrix_num_samples=4, imatrix_seq_length=8,
+        sensitivity_map_override={0: 1, 1: 1})
+    assert calls == [tmp_path / "oqe"]
