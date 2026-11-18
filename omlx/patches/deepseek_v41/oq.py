@@ -23,7 +23,11 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 
+from ...oqh import format as oqh_format
+from ...oqh import targets as oqh_targets
 from .convert import iter_source_weights, source_engram_tables, strip_draft_config
+from .oq_inventory import projection_inventory
+from .oqh import plan_widths, planned_bytes, write_experts
 from .sharding import ShardWriter
 from .storage import TensorFile, decode_array
 
@@ -390,6 +394,7 @@ def quantize(
     ngram_bits=None,
     stream_calibration=None,
     preserve_ngram_table=False,
+    hadamard=False,
 ):
     from ...oq import (
         _OQ_BPW_TARGETS,
@@ -405,6 +410,11 @@ def quantize(
         raise ValueError("V4.1 Engram bits must be one of 2, 3, 4, 6 or 8")
     if ngram_bits is not None and preserve_ngram_table:
         raise ValueError("ngram_bits cannot be combined with preserve_ngram_table")
+    if hadamard and oq_level >= oqh_targets.DEEPSEEK_V41.max_level:
+        raise ValueError(
+            "V4.1 oQh re-rounds the routed experts below oQ4; oQ4 keeps the "
+            "source FP4 experts"
+        )
     # Engram sits outside the bit budget and calibration reads the source
     # checkpoint, so keeping it at source precision changes no other tensor.
     engram_bits = (
@@ -478,6 +488,15 @@ def quantize(
             budget["remaining_weights"]["tensor_bytes"]
             + budget["engram"]["tensor_bytes"]
         )
+    # oQh experts: the bytes their affine plan holds buy the widths.
+    widths, oqh_planned = {}, 0
+    if hadamard:
+        inventory = projection_inventory(
+            source, config, mapping, preserve_mtp=preserve_mtp
+        )
+        scores = {str(k): v for k, v in (preparation.get("sensitivity") or {}).items()}
+        widths = plan_widths(inventory, allocation, scores)
+        oqh_planned = planned_bytes(inventory, allocation, widths)
     destination.parent.mkdir(parents=True, exist_ok=True)
     if shutil.disk_usage(destination.parent).free < budget["tensor_bytes"] + 1024**3:
         raise OSError("Insufficient space for V4.1 export plus 1 GiB headroom")
@@ -579,6 +598,12 @@ def quantize(
                 if not key.endswith(".weight"):
                     continue
                 name = key.removesuffix(".weight")
+                if name in widths:
+                    # Written by the oQh pass from the source model.
+                    for part in [k for k in values if k.startswith(name + ".")]:
+                        values.pop(part)
+                    specs.pop(name, None)
+                    continue
                 if name not in allocation:
                     continue
                 importance = None
@@ -632,13 +657,31 @@ def quantize(
                     / max(budget["remaining_weights"]["tensor_bytes"], 1),
                     f"Exported {i + 1} projection groups",
                 )
+    oqh_report = None
+    if widths:
+        oqh_report = write_experts(
+            source,
+            writer,
+            widths,
+            num_samples=imatrix_num_samples,
+            seq_length=imatrix_seq_length,
+            progress=lambda done, total: _emit_progress(
+                progress_callback,
+                "oqh",
+                99,
+                f"V4.1 oQh experts: layer {done}/{total}",
+            ),
+        )
+        if oqh_report["bytes"] > oqh_planned:
+            raise ValueError("V4.1 oQh experts exceed their affine budget")
+        report["oqh"] = {k: v for k, v in oqh_report.items() if k != "entries"}
     output_map = writer.finish()
     report["shard_count"] = len(set(output_map.values()))
     for spec in exported_tables.values():
         spec["weight_file"] = output_map[spec["weight_key"]]
         if spec.get("scale_key"):
             spec["scale_file"] = output_map[spec["scale_key"]]
-    if written_bytes != budget["remaining_weights"]["tensor_bytes"]:
+    if written_bytes + oqh_planned != budget["remaining_weights"]["tensor_bytes"]:
         raise ValueError("Exported non-Engram bytes differ from the independent budget")
     config.pop("quantization_config", None)
     if not preserve_mtp:
@@ -656,6 +699,11 @@ def quantize(
         ),
         "quantization_report": report,
     }
+    if oqh_report is not None:
+        config[oqh_format.CONFIG_KEY] = {
+            "version": oqh_format.FORMAT_VERSION,
+            "tensors": oqh_report["entries"],
+        }
     for name in (
         "tokenizer.json",
         "tokenizer_config.json",
